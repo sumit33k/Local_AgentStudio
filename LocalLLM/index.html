@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Local Ollama Chat</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #1a1a1a;
+    color: #e8e8e8;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    background: #252525;
+    padding: 12px 20px;
+    border-bottom: 1px solid #333;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; font-weight: 600; color: #fafafa; }
+  .controls { display: flex; gap: 10px; align-items: center; flex: 1; flex-wrap: wrap; }
+  select, button {
+    background: #333;
+    color: #e8e8e8;
+    border: 1px solid #444;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  select:hover, button:hover { background: #3d3d3d; }
+  button.danger { background: #5a2222; border-color: #7a3333; }
+  button.danger:hover { background: #6e2929; }
+  #status {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    background: #333;
+  }
+  #status.connected { background: #1f4a2c; color: #8cd9a3; }
+  #status.error { background: #4a1f1f; color: #d98c8c; }
+
+  #chat {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .msg { max-width: 85%; padding: 12px 16px; border-radius: 12px; line-height: 1.55; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: #2d4a7a; color: #fff; }
+  .msg.assistant { align-self: flex-start; background: #2a2a2a; border: 1px solid #383838; }
+  .msg.system { align-self: center; background: transparent; color: #888; font-size: 12px; font-style: italic; }
+  .msg .role { font-size: 11px; color: #999; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .msg pre { background: #111; padding: 10px; border-radius: 6px; overflow-x: auto; margin: 8px 0; font-size: 13px; }
+  .msg code { background: #111; padding: 2px 5px; border-radius: 3px; font-size: 13px; }
+
+  footer {
+    background: #252525;
+    border-top: 1px solid #333;
+    padding: 14px 20px;
+  }
+  .input-row { display: flex; gap: 10px; align-items: flex-end; }
+  textarea {
+    flex: 1;
+    background: #1a1a1a;
+    color: #e8e8e8;
+    border: 1px solid #444;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 14px;
+    font-family: inherit;
+    resize: none;
+    min-height: 44px;
+    max-height: 200px;
+  }
+  textarea:focus { outline: none; border-color: #5a7ab5; }
+  #send {
+    background: #2d6cdf;
+    border-color: #2d6cdf;
+    color: white;
+    padding: 10px 20px;
+    font-weight: 500;
+  }
+  #send:hover { background: #3a7ce8; }
+  #send:disabled { background: #444; border-color: #444; cursor: not-allowed; }
+  .typing { color: #888; font-style: italic; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🦙 Local Ollama Chat</h1>
+  <div class="controls">
+    <label style="font-size:13px;color:#aaa">Model:</label>
+    <select id="modelSelect"><option>Loading...</option></select>
+    <button onclick="loadModels()">↻ Refresh</button>
+    <button class="danger" onclick="clearChat()">Clear</button>
+    <span id="status">checking...</span>
+  </div>
+</header>
+
+<div id="chat">
+  <div class="msg system">Start chatting with your local model. Make sure Ollama is running on localhost:11434.</div>
+</div>
+
+<footer>
+  <div class="input-row">
+    <textarea id="input" placeholder="Type your message... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+    <button id="send" onclick="sendMessage()">Send</button>
+  </div>
+</footer>
+
+<script>
+const OLLAMA_URL = "http://localhost:11434";
+let messages = [];
+let isStreaming = false;
+
+const chatEl = document.getElementById("chat");
+const inputEl = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+const modelSelect = document.getElementById("modelSelect");
+const statusEl = document.getElementById("status");
+
+inputEl.addEventListener("input", () => {
+  inputEl.style.height = "auto";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
+});
+
+inputEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+async function loadModels() {
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/tags`);
+    if (!res.ok) throw new Error("Bad response");
+    const data = await res.json();
+    const models = data.models || [];
+    modelSelect.innerHTML = "";
+    if (models.length === 0) {
+      modelSelect.innerHTML = '<option value="">No models found</option>';
+      statusEl.textContent = "no models — run: ollama pull qwen2.5";
+      statusEl.className = "error";
+      return;
+    }
+    models.forEach(m => {
+      const opt = document.createElement("option");
+      opt.value = m.name;
+      opt.textContent = `${m.name} (${(m.size / 1e9).toFixed(1)}GB)`;
+      modelSelect.appendChild(opt);
+    });
+    statusEl.textContent = `connected • ${models.length} model${models.length>1?'s':''}`;
+    statusEl.className = "connected";
+  } catch (err) {
+    statusEl.textContent = "Ollama not reachable";
+    statusEl.className = "error";
+    modelSelect.innerHTML = '<option value="">--</option>';
+  }
+}
+
+function addMessage(role, content) {
+  const div = document.createElement("div");
+  div.className = `msg ${role}`;
+  if (role !== "system") {
+    const r = document.createElement("div");
+    r.className = "role";
+    r.textContent = role;
+    div.appendChild(r);
+  }
+  const c = document.createElement("div");
+  c.className = "content";
+  c.textContent = content;
+  div.appendChild(c);
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return c;
+}
+
+async function sendMessage() {
+  if (isStreaming) return;
+  const text = inputEl.value.trim();
+  if (!text) return;
+  const model = modelSelect.value;
+  if (!model) { alert("Pick a model first."); return; }
+
+  messages.push({ role: "user", content: text });
+  addMessage("user", text);
+  inputEl.value = "";
+  inputEl.style.height = "auto";
+
+  isStreaming = true;
+  sendBtn.disabled = true;
+  const target = addMessage("assistant", "");
+  target.classList.add("typing");
+  target.textContent = "thinking...";
+
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages, stream: true })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let acc = "";
+    target.textContent = "";
+    target.classList.remove("typing");
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      for (const line of chunk.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const data = JSON.parse(line);
+          if (data.message?.content) {
+            acc += data.message.content;
+            target.textContent = acc;
+            chatEl.scrollTop = chatEl.scrollHeight;
+          }
+        } catch {}
+      }
+    }
+    messages.push({ role: "assistant", content: acc });
+  } catch (err) {
+    target.textContent = `Error: ${err.message}`;
+    target.style.color = "#ff8888";
+    messages.pop();
+  } finally {
+    isStreaming = false;
+    sendBtn.disabled = false;
+    inputEl.focus();
+  }
+}
+
+function clearChat() {
+  messages = [];
+  chatEl.innerHTML = '<div class="msg system">Chat cleared.</div>';
+}
+
+loadModels();
+inputEl.focus();
+</script>
+</body>
+</html>
