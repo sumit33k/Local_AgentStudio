@@ -26,14 +26,16 @@ AGENTS_DIR.mkdir(exist_ok=True)
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 
-# CORS: set CORS_ALLOW_ALL=true for wildcard (e.g. LAN/dev), or
-# ALLOWED_ORIGINS=http://host1:3000,http://host2:3000 for explicit list.
-_CORS_ALLOW_ALL = os.getenv("CORS_ALLOW_ALL", "false").lower() == "true"
+# CORS: defaults to wildcard for LAN/dev access.
+# Set ALLOWED_ORIGINS=http://host1:3000,http://host2:3000 for an explicit list,
+# or CORS_ALLOW_ALL=false to restrict to localhost only.
+_CORS_ALLOW_ALL = os.getenv("CORS_ALLOW_ALL", "true").lower() == "true"
 _ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
-if _CORS_ALLOW_ALL:
-    _allowed_origins: list = ["*"]
-elif _ALLOWED_ORIGINS_ENV:
-    _allowed_origins = [o.strip() for o in _ALLOWED_ORIGINS_ENV.split(",") if o.strip()]
+if _ALLOWED_ORIGINS_ENV:
+    _allowed_origins: list = [o.strip() for o in _ALLOWED_ORIGINS_ENV.split(",") if o.strip()]
+    _CORS_ALLOW_ALL = False
+elif _CORS_ALLOW_ALL:
+    _allowed_origins = ["*"]
 else:
     _allowed_origins = [
         "http://localhost:3000", "http://127.0.0.1:3000",
