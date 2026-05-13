@@ -26,15 +26,27 @@ AGENTS_DIR.mkdir(exist_ok=True)
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 
-app = FastAPI(title="DeepSeek Skill Studio + Agent Studio", version="1.2.0")
+# CORS: set CORS_ALLOW_ALL=true for wildcard (e.g. LAN/dev), or
+# ALLOWED_ORIGINS=http://host1:3000,http://host2:3000 for explicit list.
+_CORS_ALLOW_ALL = os.getenv("CORS_ALLOW_ALL", "false").lower() == "true"
+_ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
+if _CORS_ALLOW_ALL:
+    _allowed_origins: list = ["*"]
+elif _ALLOWED_ORIGINS_ENV:
+    _allowed_origins = [o.strip() for o in _ALLOWED_ORIGINS_ENV.split(",") if o.strip()]
+else:
+    _allowed_origins = [
+        "http://localhost:3000", "http://127.0.0.1:3000",
+        "http://localhost:3005", "http://127.0.0.1:3005",
+    ]
+
+app = FastAPI(title="DeepSeek Skill Studio + Agent Studio", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000", "http://127.0.0.1:3000",
-        "http://localhost:3005", "http://127.0.0.1:3005",
-    ],
-    allow_credentials=True,
+    allow_origins=_allowed_origins,
+    # credentials cannot be used with wildcard origin
+    allow_credentials=not _CORS_ALLOW_ALL,
     allow_methods=["*"],
     allow_headers=["*"],
 )
