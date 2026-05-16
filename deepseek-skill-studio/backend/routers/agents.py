@@ -28,7 +28,10 @@ def load_agents() -> Dict[str, Any]:
 
 
 def save_agents(agents: Dict[str, Any]) -> None:
-    agent_file().write_text(json.dumps(agents, indent=2), encoding="utf-8")
+    path = agent_file()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(agents, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def slugify(value: str) -> str:

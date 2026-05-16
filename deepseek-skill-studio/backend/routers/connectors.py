@@ -42,7 +42,9 @@ def load_settings() -> Dict[str, Any]:
 
 
 def save_settings(settings: Dict[str, Any]) -> None:
-    SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+    tmp = SETTINGS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(settings, indent=2))
+    tmp.replace(SETTINGS_PATH)
 
 
 def mask_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,8 +112,8 @@ def github_status():
     try:
         user = gh.get_user()
         return {"ok": True, "login": user.login, "name": user.name}
-    except Exception as exc:
-        raise HTTPException(401, f"GitHub authentication failed: {exc}")
+    except Exception:
+        raise HTTPException(401, "GitHub authentication failed. Check your Personal Access Token in Settings.")
 
 
 @router.get("/connectors/github/repos")
@@ -132,8 +134,8 @@ def github_repos():
             for r in user.get_repos(sort="updated")[:50]
         ]
         return {"repos": repos}
-    except Exception as exc:
-        raise HTTPException(500, f"Failed to list repos: {exc}")
+    except Exception:
+        raise HTTPException(500, "Could not retrieve repositories. Check your GitHub token permissions.")
 
 
 @router.get("/connectors/github/repos/{owner}/{repo}/branches")
@@ -144,5 +146,5 @@ def github_branches(owner: str, repo: str):
         r = gh.get_repo(f"{owner}/{repo}")
         branches = [b.name for b in r.get_branches()]
         return {"branches": branches, "default": r.default_branch}
-    except Exception as exc:
-        raise HTTPException(500, f"Failed to list branches: {exc}")
+    except Exception:
+        raise HTTPException(500, "Could not retrieve branches. Verify the repository name and token permissions.")
