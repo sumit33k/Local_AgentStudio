@@ -127,6 +127,7 @@ h2 { margin: 0 0 16px; font-size: 15px; font-weight: 700; color: var(--text); }
 
 /* ── Layout grid ─────────────────────────────────────────────────── */
 .layout { display: grid; grid-template-columns: minmax(0,1fr) 300px; gap: 20px; align-items: start; }
+.layout:has(.maincard:only-child) { grid-template-columns: 1fr; }
 .card {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--r-xl); box-shadow: var(--shadow-md); padding: 24px;
@@ -570,3 +571,51 @@ textarea { min-height: 130px; resize: vertical; }
   font-size: inherit; padding: 0; text-decoration: underline; font-weight: 600;
 }
 .link-btn:hover { color: var(--accent); }
+
+/* ── Confirm dialog ───────────────────────────────────────────────── */
+.confirm-modal { max-width: 380px; }
+.danger-btn { background: var(--red) !important; }
+.danger-btn:hover:not(:disabled) { background: #9b0f32 !important; box-shadow: 0 4px 14px rgba(190,18,60,.32) !important; }
+
+/* ── Allowed tools checkbox grid ─────────────────────────────────── */
+.tools-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+.tool-checkbox {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; font-weight: 600;
+  background: #f8fafc; border: 1.5px solid var(--border);
+  border-radius: var(--r-sm); padding: 5px 10px; cursor: pointer;
+  transition: border-color var(--t), background var(--t);
+  text-transform: none; letter-spacing: 0;
+}
+.tool-checkbox:has(input:checked) { border-color: var(--indigo); background: var(--indigo-light); color: var(--accent); }
+.tool-checkbox input { width: 14px; height: 14px; cursor: pointer; }
+
+/* ── Provider model badge ─────────────────────────────────────────── */
+.provider-model-badge { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+
+/* ── MCP status dot: grey by default, green when connected ──────── */
+.mcp-server-status-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  background: #94a3b8;
+}
+.mcp-server-status-dot.connected {
+  background: var(--green);
+  animation: pulse-green 2s infinite;
+}
+
+/* ── Rendered preview (formatted markdown output) ─────────────────── */
+.rendered-preview {
+  background: var(--surface); color: var(--text);
+  border: 1.5px solid var(--border); font-family: inherit;
+  font-size: 14px; line-height: 1.7;
+}
+.rendered-preview h1, .rendered-preview h2, .rendered-preview h3 {
+  margin: 0.6em 0 0.3em; font-weight: 700;
+}
+.rendered-preview ul { margin: 0 0 0.6em 1.2em; padding: 0; }
+.rendered-preview li { margin-bottom: 2px; }
+.rendered-preview strong { font-weight: 700; }
+.rendered-preview code {
+  background: #f1f5f9; border-radius: 4px;
+  padding: 1px 5px; font-family: monospace; font-size: 13px;
+}
