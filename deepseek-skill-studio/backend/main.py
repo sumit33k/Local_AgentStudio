@@ -2,7 +2,9 @@
 Local AgentStudio — unified AI platform backend.
 Supports Ollama (local), Claude API, OpenAI API, and OpenAI-compatible providers.
 """
+import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
@@ -12,11 +14,31 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from docx import Document
 from pptx import Presentation
+
+# ── Logging ───────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] [%(request_id)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+
+class _RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "request_id"):
+            record.request_id = "-"
+        return True
+
+_root_logger = logging.getLogger()
+for handler in _root_logger.handlers:
+    handler.addFilter(_RequestIdFilter())
+
+logger = logging.getLogger("agentstudio")
 
 # ── Directory setup ──────────────────────────────────────────────────────
 
@@ -31,6 +53,27 @@ VECTOR_DB_PATH = APP_DIR / "data" / "vector_db"
 
 for d in (OUTPUT_DIR, RUNS_DIR, AGENTS_DIR, VECTOR_DB_PATH):
     d.mkdir(parents=True, exist_ok=True)
+
+# ── Output file cleanup ───────────────────────────────────────────────────
+
+_OUTPUT_TTL_DAYS = int(os.getenv("OUTPUT_TTL_DAYS", "7"))
+
+
+def _cleanup_old_outputs() -> None:
+    cutoff = datetime.utcnow().timestamp() - _OUTPUT_TTL_DAYS * 86400
+    removed = 0
+    for f in OUTPUT_DIR.glob("*"):
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        logging.getLogger("agentstudio").info("Cleaned up %d output file(s) older than %d days", removed, _OUTPUT_TTL_DAYS)
+
+
+_cleanup_old_outputs()
 
 # ── CORS ─────────────────────────────────────────────────────────────────
 
@@ -55,6 +98,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = getattr(request.state, "request_id", "-")
+    logger.error("Unhandled exception [%s]: %s", request_id, exc, exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "errorCode": "INTERNAL_ERROR",
+            "message": "An unexpected error occurred.",
+            "correlationId": request_id,
+            "retryable": False,
+        },
+    )
 
 # ── Include routers ──────────────────────────────────────────────────────
 
@@ -161,37 +228,63 @@ def ingest_github_repo(repo_url: str, branch: Optional[str] = None,
         ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".md", ".yml", ".yaml",
         ".json", ".sql", ".xml", ".html", ".css", ".go", ".rs", ".sh", ".txt"
     }
-    # Use GitHub token if configured
     settings = load_settings()
     token = settings.get("github_token", "")
+
+    # Build the clone environment: pass the token via GIT_ASKPASS so it never
+    # appears in the process argument list (visible via `ps aux`).
+    clone_env = os.environ.copy()
+    clone_url = repo_url
     if token and repo_url.startswith("https://github.com/"):
-        # Inject token into URL for private repo access
-        repo_url = repo_url.replace("https://github.com/", f"https://{token}@github.com/")
-    with tempfile.TemporaryDirectory() as tmp:
-        cmd = ["git", "clone", "--depth", "1"]
-        if branch:
-            cmd.extend(["--branch", branch])
-        cmd.extend([repo_url, tmp])
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        parts = [f"--- GitHub Repo: {repo_url.split('@')[-1] if '@' in repo_url else repo_url} ---"]
-        total = 0
-        for p in Path(tmp).rglob("*"):
-            if not p.is_file() or ".git" in p.parts:
-                continue
-            rel = str(p.relative_to(tmp))
-            if include_tokens and not any(tok in rel for tok in include_tokens):
-                continue
-            if exclude_tokens and any(tok in rel for tok in exclude_tokens):
-                continue
-            if p.suffix.lower() not in allowed_ext:
-                continue
-            text = f"\n--- File: {rel} ---\n{safe_read_file(p)}"
-            parts.append(text)
-            total += len(text)
-            if total > 220000:
-                parts.append("\n[Repo context truncated to stay within limits]")
-                break
-        return "\n".join(parts)
+        askpass_script = (
+            "#!/bin/sh\n"
+            f"echo '{token}'\n"
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as ask:
+            ask.write(askpass_script)
+            askpass_path = ask.name
+        os.chmod(askpass_path, 0o700)
+        clone_env["GIT_ASKPASS"] = askpass_path
+        clone_env["GIT_TERMINAL_PROMPT"] = "0"
+    else:
+        askpass_path = None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd = ["git", "clone", "--depth", "1"]
+            if branch:
+                cmd.extend(["--branch", branch])
+            cmd.extend([clone_url, tmp])
+            subprocess.run(
+                cmd, check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=clone_env,
+            )
+            parts = [f"--- GitHub Repo: {repo_url} ---"]
+            total = 0
+            for p in Path(tmp).rglob("*"):
+                if not p.is_file() or ".git" in p.parts:
+                    continue
+                rel = str(p.relative_to(tmp))
+                if include_tokens and not any(tok in rel for tok in include_tokens):
+                    continue
+                if exclude_tokens and any(tok in rel for tok in exclude_tokens):
+                    continue
+                if p.suffix.lower() not in allowed_ext:
+                    continue
+                text = f"\n--- File: {rel} ---\n{safe_read_file(p)}"
+                parts.append(text)
+                total += len(text)
+                if total > 220000:
+                    parts.append("\n[Repo context truncated to stay within limits]")
+                    break
+            return "\n".join(parts)
+    finally:
+        if askpass_path:
+            try:
+                os.unlink(askpass_path)
+            except OSError:
+                pass
 
 
 async def build_context(files: List[UploadFile], github_url: str, github_branch: str,
@@ -202,9 +295,12 @@ async def build_context(files: List[UploadFile], github_url: str, github_branch:
         text = raw.decode("utf-8", errors="ignore")[:30000]
         parts.append(f"\n--- Uploaded File: {file.filename} ---\n{text}")
     if github_url.strip():
-        parts.append(ingest_github_repo(
-            github_url.strip(), github_branch.strip() or None, include_paths, exclude_paths
-        ))
+        # Run blocking git clone + file I/O in a thread pool so the event loop stays free
+        github_content = await asyncio.to_thread(
+            ingest_github_repo,
+            github_url.strip(), github_branch.strip() or None, include_paths, exclude_paths,
+        )
+        parts.append(github_content)
     return "\n".join(parts)
 
 
@@ -399,7 +495,7 @@ async def chat(
 
 # ── Legacy: Agent create (kept for backward compat) ───────────────────────
 
-def infer_agent_spec(prompt: str, model: str) -> Dict[str, Any]:
+async def infer_agent_spec(prompt: str, model: str) -> Dict[str, Any]:
     skills = list_skills_names()
     fallback = "document_writer" if "document_writer" in skills else (skills[0] if skills else "document_writer")
     output = "pptx" if any(x in prompt.lower() for x in ["ppt", "presentation", "slide"]) else "docx"
@@ -412,17 +508,13 @@ def infer_agent_spec(prompt: str, model: str) -> Dict[str, Any]:
         "allowed_tools can include: files, github, docx, pptx, markdown, chat."
     )
     user = f"Available skills: {skills}\nAgent creation request: {prompt}"
-    import asyncio
-    import requests as req
-    ollama_url = get_ollama_url()
     m = model or get_default_model()
     try:
-        resp = req.post(
-            f"{ollama_url}/api/chat",
-            json={"model": m, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}], "stream": False},
-            timeout=300,
+        # Use the shared async LLM helper — avoids blocking the event loop with sync requests
+        raw = await llm_call(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            m,
         )
-        raw = resp.json().get("message", {}).get("content", "")
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         spec = json.loads(match.group(0) if match else raw)
     except Exception:
@@ -442,12 +534,12 @@ def infer_agent_spec(prompt: str, model: str) -> Dict[str, Any]:
 
 
 @app.post("/agent/create")
-def create_agent_legacy(
+async def create_agent_legacy(
     creation_prompt: str = Form(...),
     model: str = Form(""),
     agent_id: str = Form(""),
 ):
-    spec = infer_agent_spec(creation_prompt, model or get_default_model())
+    spec = await infer_agent_spec(creation_prompt, model or get_default_model())
     agents = load_agents()
     base_id = slugify(agent_id or spec["name"])
     new_id = base_id
@@ -591,7 +683,9 @@ async def generate(
 
 @app.get("/download/{filename}")
 def download(filename: str):
-    path = OUTPUT_DIR / filename
+    path = (OUTPUT_DIR / filename).resolve()
+    if not path.is_relative_to(OUTPUT_DIR.resolve()):
+        raise HTTPException(400, "Invalid filename")
     if not path.exists():
         raise HTTPException(404, "File not found")
     return FileResponse(path, filename=filename)

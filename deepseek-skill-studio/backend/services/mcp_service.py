@@ -23,7 +23,9 @@ class McpService:
             return {"servers": []}
 
     def save(self, data: Dict) -> None:
-        self.configs_path.write_text(json.dumps(data, indent=2))
+        tmp = self.configs_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(self.configs_path)
 
     # ── Server CRUD ─────────────────────────────────────────────────────
 

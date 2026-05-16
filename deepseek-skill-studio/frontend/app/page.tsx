@@ -40,6 +40,26 @@ function renderMarkdown(text: string): string {
     .replace(/\n/g, '<br/>');
 }
 
+// ── Confirm dialog ────────────────────────────────────────────────────────
+
+function ConfirmDialog({ message, onConfirm, onCancel }: {
+  message: string; onConfirm: () => void; onCancel: () => void;
+}) {
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal confirm-modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-body" style={{ textAlign: 'center', paddingTop: 8 }}>
+          <p style={{ margin: '0 0 20px', fontSize: 15 }}>{message}</p>
+          <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
+            <button className="secondary" style={{ width: 'auto', padding: '9px 24px' }} onClick={onCancel}>Cancel</button>
+            <button className="primary danger-btn" style={{ width: 'auto', padding: '9px 24px' }} onClick={onConfirm}>Delete</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Default settings ──────────────────────────────────────────────────────
 
 const DEFAULT_SETTINGS: Settings = {
@@ -67,7 +87,11 @@ export default function Home() {
   const [success, setSuccess] = useState('');
 
   // ── Agent mode ────────────────────────────────────────────────────────────
-  const [prompt, setPrompt] = useState('Analyze the uploaded context and create an executive-ready deliverable.');
+  const [agentPrompt, setAgentPrompt] = useState('Analyze the uploaded context and create an executive-ready deliverable.');
+  const [studioPrompt, setStudioPrompt] = useState('Generate output using the selected skill.');
+  // Unified accessor so generate() works for both tabs
+  const prompt = mode === 'studio' ? studioPrompt : agentPrompt;
+  const setPrompt = mode === 'studio' ? setStudioPrompt : setAgentPrompt;
   const [outputType, setOutputType] = useState('docx');
   const [downloadUrl, setDownloadUrl] = useState('');
   const [rawMarkdown, setRawMarkdown] = useState('');
@@ -124,6 +148,18 @@ export default function Home() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  // ── Confirm dialog ────────────────────────────────────────────────────────
+  const [confirmState, setConfirmState] = useState<{ message: string; resolve: (v: boolean) => void } | null>(null);
+
+  function confirmAction(message: string): Promise<boolean> {
+    return new Promise(resolve => setConfirmState({ message, resolve }));
+  }
+
+  function handleConfirm(result: boolean) {
+    confirmState?.resolve(result);
+    setConfirmState(null);
+  }
+
   // ── Effects ───────────────────────────────────────────────────────────────
 
   useEffect(() => { refreshAll(); }, []);
@@ -137,6 +173,12 @@ export default function Home() {
     const t = setTimeout(() => setSuccess(''), 4000);
     return () => clearTimeout(t);
   }, [success]);
+
+  useEffect(() => {
+    if (!error) return;
+    const t = setTimeout(() => setError(''), 8000);
+    return () => clearTimeout(t);
+  }, [error]);
 
   useEffect(() => {
     if (mode === 'knowledge') refreshKnowledgeBase();
@@ -268,7 +310,7 @@ export default function Home() {
   }
 
   async function deleteAgent(id: string) {
-    if (!confirm(`Delete agent "${agents[id]?.name}"?`)) return;
+    if (!await confirmAction(`Delete agent "${agents[id]?.name}"?`)) return;
     try {
       const res = await fetch(`${API}/agents/${id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Delete failed');
@@ -443,8 +485,12 @@ export default function Home() {
       const res = await fetch(`${API}/knowledge-base/${kbCollection}/upload`, { method: 'POST', body: form });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Upload failed');
-      const ok = data.results.filter((r: any) => r.chunks > 0);
-      setSuccess(`Indexed ${ok.length} file(s) into "${kbCollection}"`);
+      const ok = (data.results as any[]).filter(r => r.chunks > 0);
+      const failed = (data.results as any[]).filter(r => r.chunks === 0 && r.error);
+      if (failed.length > 0) {
+        setError(`${failed.length} file(s) failed to embed: ${failed.map((r: any) => `${r.filename} (${r.error})`).join(', ')}`);
+      }
+      if (ok.length > 0) setSuccess(`Indexed ${ok.length} file(s) into "${kbCollection}"`);
       setKbFiles(null);
       refreshKnowledgeBase();
     } catch (e: any) {
@@ -455,7 +501,7 @@ export default function Home() {
   }
 
   async function deleteKbDoc(filename: string) {
-    if (!confirm(`Remove "${filename}" from knowledge base?`)) return;
+    if (!await confirmAction(`Remove "${filename}" from knowledge base?`)) return;
     try {
       await fetch(`${API}/knowledge-base/${kbCollection}/documents/${encodeURIComponent(filename)}`, { method: 'DELETE' });
       setSuccess('Document removed');
@@ -470,10 +516,15 @@ export default function Home() {
     const form = new FormData();
     form.append('name', newCollectionName);
     try {
-      await fetch(`${API}/knowledge-base/collections`, { method: 'POST', body: form });
+      const res = await fetch(`${API}/knowledge-base/collections`, { method: 'POST', body: form });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ detail: 'Create failed' }));
+        throw new Error(data.detail || 'Create failed');
+      }
       setKbCollections(prev => [...prev, newCollectionName]);
       setKbCollection(newCollectionName);
       setNewCollectionName('');
+      setSuccess(`Collection "${newCollectionName}" created`);
     } catch (e: any) { setError(e.message); }
   }
 
@@ -507,10 +558,16 @@ export default function Home() {
   }
 
   async function deleteMcpServer(id: string) {
-    if (!confirm('Remove this MCP server?')) return;
-    await fetch(`${API}/mcp/servers/${id}`, { method: 'DELETE' });
-    setSuccess('Server removed');
-    refreshMcpServers();
+    if (!confirmAction('Remove this MCP server?')) return;
+    try {
+      const res = await fetch(`${API}/mcp/servers/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ detail: 'Delete failed' }));
+        throw new Error(data.detail || 'Delete failed');
+      }
+      setSuccess('Server removed');
+      refreshMcpServers();
+    } catch (e: any) { setError(e.message); }
   }
 
   async function listMcpTools(serverId: string) {
@@ -540,6 +597,14 @@ export default function Home() {
   return (
     <main className="container">
       {success && <div className="toast toast-success">✓ {success}</div>}
+
+      {confirmState && (
+        <ConfirmDialog
+          message={confirmState.message}
+          onConfirm={() => handleConfirm(true)}
+          onCancel={() => handleConfirm(false)}
+        />
+      )}
 
       {/* ── Settings Modal ─────────────────────────────────────────────── */}
       {settingsOpen && (
@@ -611,8 +676,10 @@ export default function Home() {
                 <div className="grid">
                   <div className="row"><label>Top-K results</label>
                     <input type="number" value={settingsDraft.rag_top_k} min={1} max={20} onChange={e => setSettingsDraft(d => ({ ...d, rag_top_k: +e.target.value }))} /></div>
-                  <div className="row"><label>Chunk size</label>
+                  <div className="row"><label>Chunk size (chars)</label>
                     <input type="number" value={settingsDraft.rag_chunk_size} min={200} max={4000} onChange={e => setSettingsDraft(d => ({ ...d, rag_chunk_size: +e.target.value }))} /></div>
+                  <div className="row"><label>Chunk overlap (chars)</label>
+                    <input type="number" value={settingsDraft.rag_chunk_overlap} min={0} max={1000} onChange={e => setSettingsDraft(d => ({ ...d, rag_chunk_overlap: +e.target.value }))} /></div>
                 </div>
               </div>
             </div>
@@ -651,6 +718,28 @@ export default function Home() {
                 </select></div>
               <div className="row"><label>System Instructions</label>
                 <textarea value={editingAgent.system_addendum || ''} onChange={e => setEditingAgent(a => a ? { ...a, system_addendum: e.target.value } : a)} /></div>
+              <div className="row">
+                <label>Allowed Tools</label>
+                <div className="tools-grid">
+                  {['files', 'github', 'docx', 'pptx', 'markdown', 'chat'].map(tool => {
+                    const checked = (editingAgent.allowed_tools || []).includes(tool);
+                    return (
+                      <label key={tool} className="tool-checkbox">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            const current = editingAgent.allowed_tools || [];
+                            const next = checked ? current.filter(t => t !== tool) : [...current, tool];
+                            setEditingAgent(a => a ? { ...a, allowed_tools: next } : a);
+                          }}
+                        />
+                        <span>{tool}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
             <div className="modal-footer">
               <button className="secondary" onClick={() => { setEditingAgentId(''); setEditingAgent(null); }}>Cancel</button>
@@ -694,12 +783,21 @@ export default function Home() {
             <div className="grid">
               <div className="row">
                 <label>Model</label>
-                {models.length > 0 ? (
-                  <select value={model} onChange={e => setModel(e.target.value)}>
-                    {models.map(m => <option key={m} value={m}>{m}</option>)}
-                  </select>
+                {settings.llm_provider === 'ollama' ? (
+                  models.length > 0 ? (
+                    <select value={model} onChange={e => setModel(e.target.value)}>
+                      {models.map(m => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                  ) : (
+                    <input value={model} onChange={e => setModel(e.target.value)} placeholder={health?.default_model || 'Model name'} />
+                  )
                 ) : (
-                  <input value={model} onChange={e => setModel(e.target.value)} placeholder={health?.default_model || 'Model name'} />
+                  <div className="provider-model-badge">
+                    <span className="agent-badge" style={{ fontSize: 12, padding: '4px 10px' }}>
+                      {settings.llm_provider === 'claude' ? settings.claude_model : settings.openai_model}
+                    </span>
+                    <span className="muted small">configured in Settings</span>
+                  </div>
                 )}
               </div>
               <div className="row">
@@ -923,9 +1021,30 @@ export default function Home() {
               <div className="kb-collections">
                 <label>Collection</label>
                 <div className="collection-row">
-                  <select value={kbCollection} onChange={e => { setKbCollection(e.target.value); }}>
-                    {kbCollections.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
+                    <select value={kbCollection} onChange={e => { setKbCollection(e.target.value); }} style={{ flex: 1 }}>
+                      {kbCollections.map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                    {kbCollection !== 'default' && (
+                      <button
+                        className="agent-action-btn danger"
+                        title="Delete this collection"
+                        onClick={async () => {
+                          if (!await confirmAction(`Delete collection "${kbCollection}" and all its documents?`)) return;
+                          try {
+                            const res = await fetch(`${API}/knowledge-base/collections/${encodeURIComponent(kbCollection)}`, { method: 'DELETE' });
+                            if (!res.ok) {
+                              const d = await res.json().catch(() => ({ detail: 'Delete failed' }));
+                              throw new Error(d.detail || 'Delete failed');
+                            }
+                            setKbCollections(prev => prev.filter(c => c !== kbCollection));
+                            setKbCollection('default');
+                            setSuccess(`Collection "${kbCollection}" deleted`);
+                          } catch (e: any) { setError(e.message); }
+                        }}
+                      >✕ Delete</button>
+                    )}
+                  </div>
                   <div className="new-collection-row">
                     <input value={newCollectionName} onChange={e => setNewCollectionName(e.target.value)}
                       placeholder="New collection name…" onKeyDown={e => e.key === 'Enter' && createNewCollection()} />
@@ -1034,7 +1153,7 @@ export default function Home() {
                   <div key={server.id} className="mcp-server-card">
                     <div className="mcp-server-header">
                       <div className="mcp-server-info">
-                        <div className="mcp-server-status-dot" />
+                        <div className={mcpTools[server.id] ? 'mcp-server-status-dot connected' : 'mcp-server-status-dot'} />
                         <div>
                           <strong>{server.name}</strong>
                           {server.description && <div className="muted small">{server.description}</div>}
@@ -1098,6 +1217,7 @@ export default function Home() {
                                   setGithubUrl(`https://github.com/${repo.full_name}`);
                                   setMode('agent');
                                   setContextOpen(true);
+                                  setSuccess(`Repo "${repo.full_name}" set as context`);
                                 }}>Use Repo</button>
                               </div>
                             ))}
@@ -1170,13 +1290,13 @@ export default function Home() {
                 <strong>Output Preview</strong>
                 <span className="muted small">{rawMarkdown.length.toLocaleString()} chars</span>
               </div>
-              <div className="preview">{rawMarkdown}</div>
+              <div className="preview rendered-preview" dangerouslySetInnerHTML={{ __html: renderMarkdown(rawMarkdown) }} />
             </div>
           )}
         </section>
 
-        {/* ── Run history sidebar ────────────────────────────────────── */}
-        <aside className="card sidecard">
+        {/* ── Run history sidebar (agent / chat / studio tabs only) ─── */}
+        {mode !== 'knowledge' && mode !== 'connectors' && <aside className="card sidecard">
           <div className="sidebar-header">
             <h2>Run History</h2>
             {runs.length > 0 && <span className="run-count">{runs.length}</span>}
@@ -1196,7 +1316,7 @@ export default function Home() {
               )}
             </div>
           ))}
-        </aside>
+        </aside>}
       </div>
     </main>
   );

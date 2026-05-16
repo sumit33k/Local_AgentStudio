@@ -61,8 +61,9 @@ def list_skills():
 
 @router.get("/skills/{name}")
 def get_skill(name: str):
-    content = read_skill(name)
-    return {"name": name, "content": content}
+    safe = _safe_name(name)
+    content = read_skill(safe)
+    return {"name": safe, "content": content}
 
 
 @router.post("/skills")
@@ -79,6 +80,7 @@ def create_skill(body: SkillCreate):
 
 @router.put("/skills/{name}")
 def update_skill(name: str, body: SkillUpdate):
+    name = _safe_name(name)
     path = SKILLS_DIR / name / "SKILL.md"
     if not path.exists():
         raise HTTPException(404, f"Skill not found: {name}")
@@ -109,6 +111,7 @@ def update_skill(name: str, body: SkillUpdate):
 @router.delete("/skills/{name}")
 def delete_skill(name: str):
     import shutil
+    name = _safe_name(name)
     skill_dir = SKILLS_DIR / name
     if not skill_dir.exists():
         raise HTTPException(404, f"Skill not found: {name}")
