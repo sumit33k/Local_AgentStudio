@@ -1,34 +1,39 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+"""
+Local AgentStudio — unified AI platform backend.
+Supports Ollama (local), Claude API, OpenAI API, and OpenAI-compatible providers.
+"""
+import json
+import os
+import re
+import subprocess
+import tempfile
+import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from docx import Document
 from pptx import Presentation
-import requests
-import uuid
-import tempfile
-import os
-import subprocess
-import json
-import re
-from datetime import datetime
+
+# ── Directory setup ──────────────────────────────────────────────────────
 
 APP_DIR = Path(__file__).parent
 OUTPUT_DIR = APP_DIR / "output"
 SKILLS_DIR = APP_DIR / "skills"
 AGENTS_DIR = APP_DIR / "agents"
 RUNS_DIR = APP_DIR / "agent_runs"
-OUTPUT_DIR.mkdir(exist_ok=True)
-RUNS_DIR.mkdir(exist_ok=True)
-AGENTS_DIR.mkdir(exist_ok=True)
+SETTINGS_PATH = APP_DIR / "settings.json"
+MCP_CONFIGS_PATH = APP_DIR / "mcp_configs.json"
+VECTOR_DB_PATH = APP_DIR / "data" / "vector_db"
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
+for d in (OUTPUT_DIR, RUNS_DIR, AGENTS_DIR, VECTOR_DB_PATH):
+    d.mkdir(parents=True, exist_ok=True)
 
-# CORS: defaults to wildcard for LAN/dev access.
-# Set ALLOWED_ORIGINS=http://host1:3000,http://host2:3000 for an explicit list,
-# or CORS_ALLOW_ALL=false to restrict to localhost only.
+# ── CORS ─────────────────────────────────────────────────────────────────
+
 _CORS_ALLOW_ALL = os.getenv("CORS_ALLOW_ALL", "true").lower() == "true"
 _ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
 if _ALLOWED_ORIGINS_ENV:
@@ -42,45 +47,77 @@ else:
         "http://localhost:3005", "http://127.0.0.1:3005",
     ]
 
-app = FastAPI(title="DeepSeek Skill Studio + Agent Studio", version="1.3.0")
-
+app = FastAPI(title="Local AgentStudio", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
-    # credentials cannot be used with wildcard origin
     allow_credentials=not _CORS_ALLOW_ALL,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ── Include routers ──────────────────────────────────────────────────────
 
-def agent_file() -> Path:
-    return AGENTS_DIR / "agents.json"
+from routers.connectors import router as connectors_router
+from routers.agents import router as agents_router
+from routers.skills import router as skills_router
+from routers.rag import router as rag_router
+from routers.mcp_router import router as mcp_router
 
+app.include_router(connectors_router)
+app.include_router(agents_router)
+app.include_router(skills_router)
+app.include_router(rag_router)
+app.include_router(mcp_router)
+
+# ── Settings helpers ─────────────────────────────────────────────────────
+
+def load_settings() -> Dict[str, Any]:
+    if not SETTINGS_PATH.exists():
+        return {}
+    try:
+        return json.loads(SETTINGS_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def get_ollama_url() -> str:
+    return load_settings().get("ollama_base_url", os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"))
+
+
+def get_default_model() -> str:
+    settings = load_settings()
+    provider = settings.get("llm_provider", "ollama")
+    if provider == "claude":
+        return settings.get("claude_model", "claude-sonnet-4-6")
+    if provider in ("openai", "openai_compat"):
+        return settings.get("openai_model", "gpt-4o")
+    return settings.get("ollama_model", os.getenv("OLLAMA_MODEL", "deepseek-r1:8b"))
+
+# ── Legacy helpers (kept for backward compat) ────────────────────────────
 
 def load_skill(skill_name: str) -> str:
-    skill_path = SKILLS_DIR / skill_name / "SKILL.md"
-    if not skill_path.exists():
-        raise HTTPException(status_code=404, detail=f"Skill not found: {skill_name}")
-    return skill_path.read_text(encoding="utf-8")
+    path = SKILLS_DIR / skill_name / "SKILL.md"
+    if not path.exists():
+        raise HTTPException(404, f"Skill not found: {skill_name}")
+    return path.read_text(encoding="utf-8")
 
 
-def list_skills() -> List[str]:
+def list_skills_names() -> List[str]:
     if not SKILLS_DIR.exists():
         return []
-    return sorted([p.name for p in SKILLS_DIR.iterdir() if p.is_dir() and (p / "SKILL.md").exists()])
+    return sorted(p.name for p in SKILLS_DIR.iterdir() if p.is_dir() and (p / "SKILL.md").exists())
 
 
 def load_agents() -> Dict[str, Any]:
-    path = agent_file()
+    path = AGENTS_DIR / "agents.json"
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def save_agents(agents: Dict[str, Any]) -> None:
-    path = agent_file()
-    path.write_text(json.dumps(agents, indent=2), encoding="utf-8")
+    (AGENTS_DIR / "agents.json").write_text(json.dumps(agents, indent=2), encoding="utf-8")
 
 
 def slugify(value: str) -> str:
@@ -91,78 +128,84 @@ def slugify(value: str) -> str:
 def get_agent(agent_id: str) -> Dict[str, Any]:
     agents = load_agents()
     if agent_id not in agents:
-        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+        raise HTTPException(404, f"Agent not found: {agent_id}")
     return agents[agent_id]
 
 
-def call_ollama(model: str, skill: str, prompt: str, context: str = "", agent_addendum: str = "") -> str:
-    final_prompt = f"""
-Skill instructions:
-{skill}
-
-Agent addendum:
-{agent_addendum}
-
-User request:
-{prompt}
-
-Context:
-{context}
-""".strip()
-
-    chat_url = f"{OLLAMA_BASE_URL}/api/chat"
-    generate_url = f"{OLLAMA_BASE_URL}/api/generate"
+def installed_ollama_models() -> List[str]:
+    import requests
+    url = get_ollama_url()
     try:
-        response = requests.post(
-            chat_url,
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": f"{skill}\n\n{agent_addendum}"},
-                    {"role": "user", "content": f"{prompt}\n\nContext:\n{context}"},
-                ],
-                "stream": False,
-            },
-            timeout=900,
-        )
-        if response.status_code == 404:
-            raise requests.HTTPError("/api/chat not available", response=response)
-        response.raise_for_status()
-        payload = response.json()
-        return payload.get("message", {}).get("content", "")
+        tags = requests.get(f"{url}/api/tags", timeout=5).json()
+        return sorted(item.get("name", "") for item in tags.get("models", []) if item.get("name"))
     except Exception:
-        try:
-            response = requests.post(
-                generate_url,
-                json={"model": model, "prompt": final_prompt, "stream": False},
-                timeout=900,
-            )
-            response.raise_for_status()
-            return response.json().get("response", "")
-        except Exception as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Ollama call failed. Confirm Ollama is running and model is pulled. Error: {exc}",
-            )
+        return []
 
 
-def call_ollama_chat(model: str, messages: List[Dict[str, str]]) -> str:
-    chat_url = f"{OLLAMA_BASE_URL}/api/chat"
-    generate_url = f"{OLLAMA_BASE_URL}/api/generate"
+def safe_read_file(path: Path, max_chars: int = 12000) -> str:
     try:
-        response = requests.post(chat_url, json={"model": model, "messages": messages, "stream": False}, timeout=900)
-        if response.status_code == 404:
-            raise requests.HTTPError("/api/chat not available", response=response)
-        response.raise_for_status()
-        return response.json().get("message", {}).get("content", "")
+        if path.stat().st_size > 2_000_000:
+            return f"[Skipped large file: {path.name}]"
+        return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
     except Exception:
-        prompt = "\n".join([f"{m.get('role','user').upper()}: {m.get('content','')}" for m in messages])
-        try:
-            response = requests.post(generate_url, json={"model": model, "prompt": prompt, "stream": False}, timeout=900)
-            response.raise_for_status()
-            return response.json().get("response", "")
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Ollama chat failed: {exc}")
+        return f"[Could not read file: {path.name}]"
+
+
+def ingest_github_repo(repo_url: str, branch: Optional[str] = None,
+                       include_paths: str = "", exclude_paths: str = "") -> str:
+    if not repo_url:
+        return ""
+    include_tokens = [x.strip() for x in include_paths.split(",") if x.strip()]
+    exclude_tokens = [x.strip() for x in exclude_paths.split(",") if x.strip()]
+    allowed_ext = {
+        ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".md", ".yml", ".yaml",
+        ".json", ".sql", ".xml", ".html", ".css", ".go", ".rs", ".sh", ".txt"
+    }
+    # Use GitHub token if configured
+    settings = load_settings()
+    token = settings.get("github_token", "")
+    if token and repo_url.startswith("https://github.com/"):
+        # Inject token into URL for private repo access
+        repo_url = repo_url.replace("https://github.com/", f"https://{token}@github.com/")
+    with tempfile.TemporaryDirectory() as tmp:
+        cmd = ["git", "clone", "--depth", "1"]
+        if branch:
+            cmd.extend(["--branch", branch])
+        cmd.extend([repo_url, tmp])
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        parts = [f"--- GitHub Repo: {repo_url.split('@')[-1] if '@' in repo_url else repo_url} ---"]
+        total = 0
+        for p in Path(tmp).rglob("*"):
+            if not p.is_file() or ".git" in p.parts:
+                continue
+            rel = str(p.relative_to(tmp))
+            if include_tokens and not any(tok in rel for tok in include_tokens):
+                continue
+            if exclude_tokens and any(tok in rel for tok in exclude_tokens):
+                continue
+            if p.suffix.lower() not in allowed_ext:
+                continue
+            text = f"\n--- File: {rel} ---\n{safe_read_file(p)}"
+            parts.append(text)
+            total += len(text)
+            if total > 220000:
+                parts.append("\n[Repo context truncated to stay within limits]")
+                break
+        return "\n".join(parts)
+
+
+async def build_context(files: List[UploadFile], github_url: str, github_branch: str,
+                        include_paths: str, exclude_paths: str) -> str:
+    parts = []
+    for file in files:
+        raw = await file.read()
+        text = raw.decode("utf-8", errors="ignore")[:30000]
+        parts.append(f"\n--- Uploaded File: {file.filename} ---\n{text}")
+    if github_url.strip():
+        parts.append(ingest_github_repo(
+            github_url.strip(), github_branch.strip() or None, include_paths, exclude_paths
+        ))
+    return "\n".join(parts)
 
 
 def create_docx(content: str, output_path: Path, title: str = "Generated Document"):
@@ -212,126 +255,179 @@ def create_pptx(content: str, output_path: Path):
     prs.save(output_path)
 
 
-def safe_read_file(path: Path, max_chars: int = 12000) -> str:
-    try:
-        if path.stat().st_size > 2_000_000:
-            return f"[Skipped large file: {path.name}]"
-        return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
-    except Exception:
-        return f"[Could not read file: {path.name}]"
-
-
-def ingest_github_repo(repo_url: str, branch: Optional[str] = None, include_paths: str = "", exclude_paths: str = "") -> str:
-    if not repo_url:
-        return ""
-    include_tokens = [x.strip() for x in include_paths.split(",") if x.strip()]
-    exclude_tokens = [x.strip() for x in exclude_paths.split(",") if x.strip()]
-    allowed_ext = {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".md", ".yml", ".yaml", ".json", ".sql", ".xml", ".html", ".css", ".go", ".rs", ".sh", ".txt"}
-    with tempfile.TemporaryDirectory() as tmp:
-        cmd = ["git", "clone", "--depth", "1"]
-        if branch:
-            cmd.extend(["--branch", branch])
-        cmd.extend([repo_url, tmp])
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        parts = [f"--- GitHub Repo: {repo_url} ---"]
-        total = 0
-        for p in Path(tmp).rglob("*"):
-            if not p.is_file() or ".git" in p.parts:
-                continue
-            rel = str(p.relative_to(tmp))
-            if include_tokens and not any(tok in rel for tok in include_tokens):
-                continue
-            if exclude_tokens and any(tok in rel for tok in exclude_tokens):
-                continue
-            if p.suffix.lower() not in allowed_ext:
-                continue
-            text = f"\n--- File: {rel} ---\n{safe_read_file(p)}"
-            parts.append(text)
-            total += len(text)
-            if total > 220000:
-                parts.append("\n[Repo context truncated to stay within local model limits]")
-                break
-        return "\n".join(parts)
-
-
-async def build_context(files: List[UploadFile], github_url: str, github_branch: str, include_paths: str, exclude_paths: str) -> str:
-    context_parts = []
-    for file in files:
-        raw = await file.read()
-        text = raw.decode("utf-8", errors="ignore")[:30000]
-        context_parts.append(f"\n--- Uploaded File: {file.filename} ---\n{text}")
-    if github_url.strip():
-        context_parts.append(ingest_github_repo(github_url.strip(), github_branch.strip() or None, include_paths, exclude_paths))
-    return "\n".join(context_parts)
-
-
 def write_output(content: str, output_type: str, title: str = "Generated Output") -> Path:
     file_id = str(uuid.uuid4())
     if output_type == "docx":
-        output_path = OUTPUT_DIR / f"{file_id}.docx"
-        create_docx(content, output_path, title)
+        path = OUTPUT_DIR / f"{file_id}.docx"
+        create_docx(content, path, title)
     elif output_type == "pptx":
-        output_path = OUTPUT_DIR / f"{file_id}.pptx"
-        create_pptx(content, output_path)
+        path = OUTPUT_DIR / f"{file_id}.pptx"
+        create_pptx(content, path)
     else:
-        output_path = OUTPUT_DIR / f"{file_id}.md"
-        output_path.write_text(content, encoding="utf-8")
-    return output_path
-
-
-def log_agent_run(payload: Dict[str, Any]) -> Path:
-    run_id = payload.get("run_id") or str(uuid.uuid4())
-    path = RUNS_DIR / f"{run_id}.json"
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        path = OUTPUT_DIR / f"{file_id}.md"
+        path.write_text(content, encoding="utf-8")
     return path
 
 
-def installed_models() -> List[str]:
+def log_agent_run(payload: Dict[str, Any]) -> None:
+    run_id = payload.get("run_id") or str(uuid.uuid4())
+    path = RUNS_DIR / f"{run_id}.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+async def llm_call(messages: List[Dict], model: Optional[str] = None) -> str:
+    settings = load_settings()
+    from services.llm_service import LLMService
+    svc = LLMService(settings)
+    return await svc.chat_complete(messages, model)
+
+
+# ── Health ────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    settings = load_settings()
+    provider = settings.get("llm_provider", "ollama")
+    models = installed_ollama_models()
+    return {
+        "status": "ok",
+        "provider": provider,
+        "ollama_ok": bool(models),
+        "ollama_base_url": get_ollama_url(),
+        "models": models,
+        "default_model": get_default_model(),
+    }
+
+
+@app.get("/models")
+def models():
+    return {"models": installed_ollama_models(), "default_model": get_default_model()}
+
+
+# ── Chat (streaming + non-streaming) ─────────────────────────────────────
+
+@app.post("/chat")
+async def chat(
+    message: str = Form(...),
+    model: str = Form(""),
+    agent_id: str = Form(""),
+    history_json: str = Form("[]"),
+    github_url: str = Form(""),
+    github_branch: str = Form(""),
+    include_paths: str = Form(""),
+    exclude_paths: str = Form("node_modules,.git,dist,build,.venv,__pycache__"),
+    use_rag: bool = Form(False),
+    rag_collection: str = Form("default"),
+    stream: bool = Form(False),
+    files: List[UploadFile] = File(default=[]),
+):
+    settings = load_settings()
+    from services.llm_service import LLMService
+    from services.rag_service import RagService
+
+    llm = LLMService(settings)
+    selected_model = model or llm.default_model()
+
     try:
-        tags = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5).json()
-        models = []
-        for item in tags.get("models", []):
-            name = item.get("name")
-            if name:
-                models.append(name)
-        return sorted(models)
+        history = json.loads(history_json or "[]")
+        if not isinstance(history, list):
+            history = []
     except Exception:
-        return []
+        history = []
+
+    agent_instruction = "You are a helpful local AI assistant. Be direct and practical."
+    if agent_id:
+        try:
+            agent = get_agent(agent_id)
+            skill = load_skill(agent.get("default_skill", "document_writer"))
+            agent_instruction = f"{skill}\n\nAgent behavior:\n{agent.get('system_addendum', '')}"
+        except Exception:
+            pass
+
+    context = await build_context(files, github_url, github_branch, include_paths, exclude_paths)
+
+    # Augment with RAG if requested
+    rag_sources = []
+    if use_rag and settings.get("rag_enabled", True):
+        try:
+            rag = RagService(VECTOR_DB_PATH)
+            top_k = settings.get("rag_top_k", 5)
+            hits = await rag.query(message, llm, rag_collection, top_k)
+            if hits:
+                rag_sources = hits
+                context = rag.build_context_from_hits(hits) + ("\n\n" + context if context else "")
+        except Exception:
+            pass
+
+    messages = [{"role": "system", "content": agent_instruction}]
+    if context:
+        messages.append({"role": "user", "content": f"Use this context:\n{context}"})
+        messages.append({"role": "assistant", "content": "Understood, I'll use the provided context."})
+    for h in history[-12:]:
+        role = h.get("role") if h.get("role") in ["user", "assistant"] else "user"
+        content = str(h.get("content", ""))[:12000]
+        if content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": message})
+
+    if stream:
+        async def event_generator():
+            try:
+                async for chunk in llm.chat_stream(messages, selected_model):
+                    payload = json.dumps({"type": "text", "chunk": chunk})
+                    yield f"data: {payload}\n\n"
+                done_payload = json.dumps({"type": "done", "rag_sources": [
+                    {"filename": h["filename"], "score": h["score"]} for h in rag_sources
+                ]})
+                yield f"data: {done_payload}\n\n"
+            except Exception as exc:
+                err_payload = json.dumps({"type": "error", "message": str(exc)})
+                yield f"data: {err_payload}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    reply = await llm.chat_complete(messages, selected_model)
+    return {
+        "reply": reply,
+        "rag_sources": [{"filename": h["filename"], "score": h["score"]} for h in rag_sources],
+    }
 
 
-def infer_agent_spec_from_prompt(prompt: str, model: str) -> Dict[str, Any]:
-    skills = list_skills()
-    fallback_skill = "document_writer" if "document_writer" in skills else (skills[0] if skills else "document_writer")
-    output = "pptx" if any(x in prompt.lower() for x in ["ppt", "presentation", "slide", "deck"]) else "docx"
+# ── Legacy: Agent create (kept for backward compat) ───────────────────────
+
+def infer_agent_spec(prompt: str, model: str) -> Dict[str, Any]:
+    skills = list_skills_names()
+    fallback = "document_writer" if "document_writer" in skills else (skills[0] if skills else "document_writer")
+    output = "pptx" if any(x in prompt.lower() for x in ["ppt", "presentation", "slide"]) else "docx"
     if any(x in prompt.lower() for x in ["markdown", "md", "analysis only", "chat"]):
         output = "md"
-
-    system = """
-Create one JSON object for a local AI agent. Return only valid JSON, no markdown.
-Fields: name, description, default_skill, default_output, system_addendum, allowed_tools.
-Allowed default_output values: docx, pptx, md.
-Pick default_skill from the provided skills only.
-allowed_tools can include files, github, docx, pptx, markdown, chat.
-""".strip()
+    system = (
+        "Create one JSON object for a local AI agent. Return only valid JSON, no markdown.\n"
+        "Fields: name, description, default_skill, default_output, system_addendum, allowed_tools.\n"
+        "Allowed default_output: docx, pptx, md. Pick default_skill from the provided list only.\n"
+        "allowed_tools can include: files, github, docx, pptx, markdown, chat."
+    )
     user = f"Available skills: {skills}\nAgent creation request: {prompt}"
+    import asyncio
+    import requests as req
+    ollama_url = get_ollama_url()
+    m = model or get_default_model()
     try:
-        raw = call_ollama_chat(model, [{"role": "system", "content": system}, {"role": "user", "content": user}])
+        resp = req.post(
+            f"{ollama_url}/api/chat",
+            json={"model": m, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}], "stream": False},
+            timeout=300,
+        )
+        raw = resp.json().get("message", {}).get("content", "")
         match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            spec = json.loads(match.group(0))
-        else:
-            spec = json.loads(raw)
+        spec = json.loads(match.group(0) if match else raw)
     except Exception:
-        spec = {
-            "name": prompt.strip().split("\n")[0][:60] or "Custom Agent",
-            "description": f"Custom agent created from prompt: {prompt[:120]}",
-            "default_skill": fallback_skill,
-            "default_output": output,
-            "system_addendum": f"Act as a focused local agent for this objective: {prompt}. Ask clarifying questions only when necessary. Produce practical, structured output.",
-            "allowed_tools": ["files", "github", "docx", "pptx", "markdown", "chat"],
-        }
-
-    default_skill = spec.get("default_skill") if spec.get("default_skill") in skills else fallback_skill
+        spec = {}
+    default_skill = spec.get("default_skill") if spec.get("default_skill") in skills else fallback
     default_output = spec.get("default_output") if spec.get("default_output") in ["docx", "pptx", "md"] else output
     return {
         "name": str(spec.get("name") or "Custom Agent")[:80],
@@ -345,34 +441,13 @@ allowed_tools can include files, github, docx, pptx, markdown, chat.
     }
 
 
-@app.get("/health")
-def health():
-    models = installed_models()
-    return {"status": "ok", "ollama_ok": bool(models), "ollama_base_url": OLLAMA_BASE_URL, "models": models}
-
-
-@app.get("/models")
-def models():
-    return {"models": installed_models(), "default_model": DEFAULT_MODEL}
-
-
-@app.get("/skills")
-def skills():
-    return {"skills": list_skills()}
-
-
-@app.get("/agents")
-def agents():
-    return {"agents": load_agents()}
-
-
 @app.post("/agent/create")
-def create_agent(
+def create_agent_legacy(
     creation_prompt: str = Form(...),
-    model: str = Form(DEFAULT_MODEL),
+    model: str = Form(""),
     agent_id: str = Form(""),
 ):
-    spec = infer_agent_spec_from_prompt(creation_prompt, model)
+    spec = infer_agent_spec(creation_prompt, model or get_default_model())
     agents = load_agents()
     base_id = slugify(agent_id or spec["name"])
     new_id = base_id
@@ -390,19 +465,46 @@ async def agent_run(
     prompt: str = Form(...),
     agent_id: str = Form(...),
     output_type: str = Form(""),
-    model: str = Form(DEFAULT_MODEL),
+    model: str = Form(""),
     github_url: str = Form(""),
     github_branch: str = Form(""),
     include_paths: str = Form(""),
     exclude_paths: str = Form("node_modules,.git,dist,build,.venv,__pycache__"),
+    use_rag: bool = Form(False),
+    rag_collection: str = Form("default"),
     files: List[UploadFile] = File(default=[]),
 ):
+    settings = load_settings()
     agent = get_agent(agent_id)
     skill_name = agent.get("default_skill", "document_writer")
     selected_output = output_type or agent.get("default_output", "md")
     context = await build_context(files, github_url, github_branch, include_paths, exclude_paths)
+
+    # RAG augmentation
+    rag_sources = []
+    if use_rag and settings.get("rag_enabled", True):
+        try:
+            from services.llm_service import LLMService
+            from services.rag_service import RagService
+            llm_svc = LLMService(settings)
+            rag = RagService(VECTOR_DB_PATH)
+            hits = await rag.query(prompt, llm_svc, rag_collection, settings.get("rag_top_k", 5))
+            if hits:
+                rag_sources = hits
+                context = rag.build_context_from_hits(hits) + ("\n\n" + context if context else "")
+        except Exception:
+            pass
+
     skill = load_skill(skill_name)
-    result = call_ollama(model, skill, prompt, context, agent.get("system_addendum", ""))
+    agent_addendum = agent.get("system_addendum", "")
+
+    selected_model = model or get_default_model()
+    messages = [
+        {"role": "system", "content": f"{skill}\n\nAgent behavior:\n{agent_addendum}"},
+        {"role": "user", "content": f"{prompt}\n\nContext:\n{context}" if context else prompt},
+    ]
+    result = await llm_call(messages, selected_model)
+
     output_path = write_output(result, selected_output, agent.get("name", "Agent Output"))
     run_id = str(uuid.uuid4())
     log_agent_run({
@@ -411,55 +513,21 @@ async def agent_run(
         "agent_id": agent_id,
         "agent_name": agent.get("name"),
         "skill_name": skill_name,
-        "model": model,
+        "model": selected_model,
         "output_type": selected_output,
         "github_url": github_url,
-        "include_paths": include_paths,
-        "exclude_paths": exclude_paths,
         "download_file": output_path.name,
         "prompt": prompt,
         "raw_markdown": result,
+        "rag_sources": [h["filename"] for h in rag_sources],
     })
-    return {"run_id": run_id, "filename": output_path.name, "download_url": f"/download/{output_path.name}", "raw_markdown": result}
-
-
-@app.post("/chat")
-async def chat(
-    message: str = Form(...),
-    model: str = Form(DEFAULT_MODEL),
-    agent_id: str = Form(""),
-    history_json: str = Form("[]"),
-    github_url: str = Form(""),
-    github_branch: str = Form(""),
-    include_paths: str = Form(""),
-    exclude_paths: str = Form("node_modules,.git,dist,build,.venv,__pycache__"),
-    files: List[UploadFile] = File(default=[]),
-):
-    try:
-        history = json.loads(history_json or "[]")
-        if not isinstance(history, list):
-            history = []
-    except Exception:
-        history = []
-
-    agent_instruction = "You are a helpful local DeepSeek chat assistant. Be direct and practical."
-    if agent_id:
-        agent = get_agent(agent_id)
-        skill = load_skill(agent.get("default_skill", "document_writer"))
-        agent_instruction = f"{skill}\n\nAgent behavior:\n{agent.get('system_addendum', '')}"
-
-    context = await build_context(files, github_url, github_branch, include_paths, exclude_paths)
-    messages = [{"role": "system", "content": agent_instruction}]
-    if context:
-        messages.append({"role": "user", "content": f"Use this context for this chat session:\n{context}"})
-    for h in history[-12:]:
-        role = h.get("role") if h.get("role") in ["user", "assistant"] else "user"
-        content = str(h.get("content", ""))[:12000]
-        if content:
-            messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": message})
-    reply = call_ollama_chat(model, messages)
-    return {"reply": reply}
+    return {
+        "run_id": run_id,
+        "filename": output_path.name,
+        "download_url": f"/download/{output_path.name}",
+        "raw_markdown": result,
+        "rag_sources": rag_sources,
+    }
 
 
 @app.get("/agent/runs")
@@ -480,26 +548,50 @@ async def generate(
     prompt: str = Form(...),
     skill_name: str = Form(...),
     output_type: str = Form(...),
-    model: str = Form(DEFAULT_MODEL),
+    model: str = Form(""),
     github_url: str = Form(""),
     github_branch: str = Form(""),
     include_paths: str = Form(""),
     exclude_paths: str = Form("node_modules,.git,dist,build,.venv,__pycache__"),
+    use_rag: bool = Form(False),
+    rag_collection: str = Form("default"),
     files: List[UploadFile] = File(default=[]),
 ):
-    try:
-        context = await build_context(files, github_url, github_branch, include_paths, exclude_paths)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"GitHub or file ingestion failed: {exc}")
+    context = await build_context(files, github_url, github_branch, include_paths, exclude_paths)
+    settings = load_settings()
+    rag_sources = []
+    if use_rag and settings.get("rag_enabled", True):
+        try:
+            from services.llm_service import LLMService
+            from services.rag_service import RagService
+            llm_svc = LLMService(settings)
+            rag = RagService(VECTOR_DB_PATH)
+            hits = await rag.query(prompt, llm_svc, rag_collection, settings.get("rag_top_k", 5))
+            if hits:
+                rag_sources = hits
+                context = rag.build_context_from_hits(hits) + ("\n\n" + context if context else "")
+        except Exception:
+            pass
+
     skill = load_skill(skill_name)
-    result = call_ollama(model, skill, prompt, context)
+    selected_model = model or get_default_model()
+    messages = [
+        {"role": "system", "content": skill},
+        {"role": "user", "content": f"{prompt}\n\nContext:\n{context}" if context else prompt},
+    ]
+    result = await llm_call(messages, selected_model)
     output_path = write_output(result, output_type)
-    return {"filename": output_path.name, "download_url": f"/download/{output_path.name}", "raw_markdown": result}
+    return {
+        "filename": output_path.name,
+        "download_url": f"/download/{output_path.name}",
+        "raw_markdown": result,
+        "rag_sources": rag_sources,
+    }
 
 
 @app.get("/download/{filename}")
 def download(filename: str):
     path = OUTPUT_DIR / filename
     if not path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(404, "File not found")
     return FileResponse(path, filename=filename)
