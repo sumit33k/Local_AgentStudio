@@ -17,7 +17,7 @@ FRONTEND_DIR="${PROJECT_ROOT}/deepseek-skill-studio/frontend"
 
 BACKEND_HOST="127.0.0.1"
 BACKEND_PORT="8000"
-FRONTEND_PORT="3000"
+FRONTEND_PORT="3005"
 
 # PID tracking for cleanup
 BACKEND_PID=""
