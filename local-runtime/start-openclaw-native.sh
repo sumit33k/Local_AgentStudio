@@ -35,24 +35,10 @@ echo "[INFO] Using Node.js ${NODE_VERSION}"
 # ---------------------------------------------------------------------------
 if [ ! -f "${VENDOR_DIR}/package.json" ]; then
     echo "[ERROR] vendor/openclaw/package.json not found at: ${VENDOR_DIR}"
-    echo "        The OpenClaw submodule may not be initialised."
     echo ""
-    echo "        To fix:"
+    echo "        The OpenClaw submodule may not be initialised. Run:"
     echo "          git submodule update --init vendor/openclaw"
-    echo "          cd vendor/openclaw && npm install"
     exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Warn if node_modules is missing
-# ---------------------------------------------------------------------------
-if [ ! -d "${VENDOR_DIR}/node_modules" ]; then
-    echo "[WARN] node_modules not found in ${VENDOR_DIR}"
-    echo "       Run the following before starting the gateway:"
-    echo "         cd ${VENDOR_DIR}"
-    echo "         npm install"
-    echo ""
-    echo "[INFO] Attempting to continue anyway (npx fallback may work)..."
 fi
 
 # ---------------------------------------------------------------------------
@@ -60,8 +46,63 @@ fi
 # ---------------------------------------------------------------------------
 if [ ! -f "${OPENCLAW_MJS}" ]; then
     echo "[ERROR] openclaw.mjs not found at: ${OPENCLAW_MJS}"
-    echo "        The OpenClaw package may be incomplete."
+    echo ""
     echo "        Run: git submodule update --init vendor/openclaw"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Install dependencies if node_modules is missing
+# ---------------------------------------------------------------------------
+if [ ! -d "${VENDOR_DIR}/node_modules" ]; then
+    echo "[INFO] node_modules not found — running npm install in ${VENDOR_DIR} ..."
+    (cd "${VENDOR_DIR}" && npm install --prefer-offline 2>&1) || {
+        echo "[ERROR] npm install failed."
+        echo "        Make sure you have network access and npm is on your PATH."
+        exit 1
+    }
+    echo "[INFO] npm install complete."
+    echo ""
+fi
+
+# ---------------------------------------------------------------------------
+# Build if dist/entry.mjs is missing (source-tree install)
+# ---------------------------------------------------------------------------
+DIST_ENTRY="${VENDOR_DIR}/dist/entry.mjs"
+if [ ! -f "${DIST_ENTRY}" ]; then
+    echo "[INFO] Build output not found at dist/entry.mjs — building OpenClaw ..."
+    echo "[INFO] This runs once; subsequent starts will skip this step."
+    echo ""
+
+    # Prefer pnpm if available (project standard), fall back to npm
+    if command -v pnpm &>/dev/null; then
+        echo "[INFO] Using pnpm ..."
+        (cd "${VENDOR_DIR}" && pnpm install && pnpm build 2>&1) || {
+            echo "[ERROR] pnpm build failed."
+            echo "        Try manually:"
+            echo "          cd ${VENDOR_DIR} && pnpm install && pnpm build"
+            exit 1
+        }
+    else
+        echo "[INFO] pnpm not found; falling back to npm ..."
+        (cd "${VENDOR_DIR}" && npm install && npm run build 2>&1) || {
+            echo "[ERROR] npm build failed."
+            echo "        Or install pnpm and retry:"
+            echo "          npm install -g pnpm"
+            echo "          cd ${VENDOR_DIR} && pnpm install && pnpm build"
+            exit 1
+        }
+    fi
+
+    echo ""
+    echo "[INFO] Build complete."
+    echo ""
+fi
+
+# Sanity-check: dist/entry.mjs must now exist
+if [ ! -f "${DIST_ENTRY}" ]; then
+    echo "[ERROR] Build finished but dist/entry.mjs still not found."
+    echo "        Check the build output above for errors."
     exit 1
 fi
 

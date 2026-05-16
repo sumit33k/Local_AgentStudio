@@ -84,6 +84,10 @@ class OpenClawRuntimeService:
     def _check_node_modules(self) -> bool:
         return (self.vendor_path / "node_modules").is_dir()
 
+    def _check_built(self) -> bool:
+        """Return True if the dist/entry.mjs build output exists."""
+        return (self.vendor_path / "dist" / "entry.mjs").is_file()
+
     @staticmethod
     def _node_available() -> bool:
         try:
@@ -101,7 +105,7 @@ class OpenClawRuntimeService:
     def dependency_status(self) -> str:
         if not self.is_installed():
             return "missing"
-        if self._check_node_modules():
+        if self._check_node_modules() and self._check_built():
             return "ok"
         return "missing"
 
@@ -116,7 +120,8 @@ class OpenClawRuntimeService:
         """
         Start the OpenClaw gateway subprocess.
 
-        Tries node openclaw.mjs first; falls back to npx openclaw.
+        Automatically runs npm/pnpm install + build if the vendor directory is
+        an unbuilt source tree (missing node_modules or dist/entry.mjs).
         Returns True on successful start.
         """
         if self.is_running():
@@ -133,6 +138,31 @@ class OpenClawRuntimeService:
             msg = "node binary not found on PATH; cannot start OpenClaw gateway"
             logger.error(msg)
             self._last_error = msg
+            return False
+
+        # Auto-install dependencies if node_modules is missing
+        if not self._check_node_modules():
+            logger.info("node_modules missing — running npm install in %s", self.vendor_path)
+            self._log_buffer.append("[setup] Running npm install...")
+            ok = await asyncio.to_thread(self._run_npm_install)
+            if not ok:
+                self._last_error = "npm install failed — check logs for details"
+                return False
+            self._log_buffer.append("[setup] npm install complete.")
+
+        # Auto-build if dist/entry.mjs is missing (source-tree install)
+        if not self._check_built():
+            logger.info("dist/entry.mjs missing — building OpenClaw in %s", self.vendor_path)
+            self._log_buffer.append("[setup] Building OpenClaw (pnpm build / npm run build)...")
+            ok = await asyncio.to_thread(self._run_build)
+            if not ok:
+                self._last_error = "build failed — run `pnpm install && pnpm build` in vendor/openclaw"
+                return False
+            self._log_buffer.append("[setup] Build complete.")
+
+        if not self._check_built():
+            self._last_error = "dist/entry.mjs not found after build — build may have failed silently"
+            logger.error(self._last_error)
             return False
 
         mjs_path = self.vendor_path / "openclaw.mjs"
@@ -160,6 +190,83 @@ class OpenClawRuntimeService:
                 self.gateway_url,
             )
         return started
+
+    def _run_npm_install(self) -> bool:
+        """Synchronous: run npm install in vendor_path. Never shell=True."""
+        try:
+            result = subprocess.run(
+                ["npm", "install", "--prefer-offline"],
+                cwd=str(self.vendor_path),
+                capture_output=True,
+                text=True,
+                timeout=300,
+                shell=False,
+            )
+            for line in result.stdout.splitlines():
+                self._log_buffer.append(f"[npm install] {line}")
+            for line in result.stderr.splitlines():
+                self._log_buffer.append(f"[npm install] {line}")
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            self._log_buffer.append(f"[npm install] error: {exc}")
+            logger.warning("npm install error: %s", exc)
+            return False
+
+    def _run_build(self) -> bool:
+        """
+        Synchronous: build OpenClaw in vendor_path.
+        Prefers pnpm (project standard); falls back to npm run build.
+        Never shell=True.
+        """
+        for pkg_manager, build_cmd in [
+            ("pnpm", ["pnpm", "install", "--frozen-lockfile=false"]),
+            ("npm", ["npm", "install"]),
+        ]:
+            try:
+                subprocess.run(
+                    ["node", "--version"],  # confirm node still available
+                    capture_output=True, shell=False, timeout=5,
+                )
+                subprocess.run(
+                    [pkg_manager, "--version"],
+                    capture_output=True, shell=False, timeout=5,
+                    check=True,
+                )
+            except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                continue  # try next
+
+            # Install
+            try:
+                r = subprocess.run(
+                    [pkg_manager, "install"],
+                    cwd=str(self.vendor_path),
+                    capture_output=True, text=True, timeout=300, shell=False,
+                )
+                for line in r.stdout.splitlines():
+                    self._log_buffer.append(f"[{pkg_manager} install] {line}")
+                if r.returncode != 0:
+                    continue
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                continue
+
+            # Build
+            try:
+                build_args = [pkg_manager, "run", "build"] if pkg_manager == "npm" else [pkg_manager, "build"]
+                r = subprocess.run(
+                    build_args,
+                    cwd=str(self.vendor_path),
+                    capture_output=True, text=True, timeout=300, shell=False,
+                )
+                for line in r.stdout.splitlines():
+                    self._log_buffer.append(f"[{pkg_manager} build] {line}")
+                for line in r.stderr.splitlines():
+                    self._log_buffer.append(f"[{pkg_manager} build] {line}")
+                if r.returncode == 0:
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                continue
+
+        return False
 
     async def _launch(self, cmd: list, cwd: Path) -> bool:
         """
