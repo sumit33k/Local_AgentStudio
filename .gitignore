@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Backend runtime data (contains API keys - never commit)
+deepseek-skill-studio/backend/settings.json
+deepseek-skill-studio/backend/data/
+
+# Generated outputs (large, ephemeral)
+deepseek-skill-studio/backend/output/
+deepseek-skill-studio/backend/agent_runs/
+
+# Node.js
+node_modules/
+.next/
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
