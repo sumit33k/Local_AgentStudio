@@ -130,12 +130,22 @@ from routers.agents import router as agents_router
 from routers.skills import router as skills_router
 from routers.rag import router as rag_router
 from routers.mcp_router import router as mcp_router
+from routers.openclaw import router as openclaw_router
+from routers.permissions import router as permissions_router
+from routers.audit import router as audit_router
+from routers.conversations import router as conversations_router
+from routers.diagnostics import router as diagnostics_router
 
 app.include_router(connectors_router)
 app.include_router(agents_router)
 app.include_router(skills_router)
 app.include_router(rag_router)
 app.include_router(mcp_router)
+app.include_router(openclaw_router)
+app.include_router(permissions_router)
+app.include_router(audit_router)
+app.include_router(conversations_router)
+app.include_router(diagnostics_router)
 
 # ── Settings helpers ─────────────────────────────────────────────────────
 
