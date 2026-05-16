@@ -2,6 +2,7 @@
 Local AgentStudio — unified AI platform backend.
 Supports Ollama (local), Claude API, OpenAI API, and OpenAI-compatible providers.
 """
+import asyncio
 import json
 import os
 import re
@@ -202,9 +203,12 @@ async def build_context(files: List[UploadFile], github_url: str, github_branch:
         text = raw.decode("utf-8", errors="ignore")[:30000]
         parts.append(f"\n--- Uploaded File: {file.filename} ---\n{text}")
     if github_url.strip():
-        parts.append(ingest_github_repo(
-            github_url.strip(), github_branch.strip() or None, include_paths, exclude_paths
-        ))
+        # Run blocking git clone + file I/O in a thread pool so the event loop stays free
+        github_content = await asyncio.to_thread(
+            ingest_github_repo,
+            github_url.strip(), github_branch.strip() or None, include_paths, exclude_paths,
+        )
+        parts.append(github_content)
     return "\n".join(parts)
 
 
@@ -399,7 +403,7 @@ async def chat(
 
 # ── Legacy: Agent create (kept for backward compat) ───────────────────────
 
-def infer_agent_spec(prompt: str, model: str) -> Dict[str, Any]:
+async def infer_agent_spec(prompt: str, model: str) -> Dict[str, Any]:
     skills = list_skills_names()
     fallback = "document_writer" if "document_writer" in skills else (skills[0] if skills else "document_writer")
     output = "pptx" if any(x in prompt.lower() for x in ["ppt", "presentation", "slide"]) else "docx"
@@ -412,17 +416,13 @@ def infer_agent_spec(prompt: str, model: str) -> Dict[str, Any]:
         "allowed_tools can include: files, github, docx, pptx, markdown, chat."
     )
     user = f"Available skills: {skills}\nAgent creation request: {prompt}"
-    import asyncio
-    import requests as req
-    ollama_url = get_ollama_url()
     m = model or get_default_model()
     try:
-        resp = req.post(
-            f"{ollama_url}/api/chat",
-            json={"model": m, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}], "stream": False},
-            timeout=300,
+        # Use the shared async LLM helper — avoids blocking the event loop with sync requests
+        raw = await llm_call(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            m,
         )
-        raw = resp.json().get("message", {}).get("content", "")
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         spec = json.loads(match.group(0) if match else raw)
     except Exception:
@@ -442,12 +442,12 @@ def infer_agent_spec(prompt: str, model: str) -> Dict[str, Any]:
 
 
 @app.post("/agent/create")
-def create_agent_legacy(
+async def create_agent_legacy(
     creation_prompt: str = Form(...),
     model: str = Form(""),
     agent_id: str = Form(""),
 ):
-    spec = infer_agent_spec(creation_prompt, model or get_default_model())
+    spec = await infer_agent_spec(creation_prompt, model or get_default_model())
     agents = load_agents()
     base_id = slugify(agent_id or spec["name"])
     new_id = base_id
@@ -591,7 +591,9 @@ async def generate(
 
 @app.get("/download/{filename}")
 def download(filename: str):
-    path = OUTPUT_DIR / filename
+    path = (OUTPUT_DIR / filename).resolve()
+    if not path.is_relative_to(OUTPUT_DIR.resolve()):
+        raise HTTPException(400, "Invalid filename")
     if not path.exists():
         raise HTTPException(404, "File not found")
     return FileResponse(path, filename=filename)
