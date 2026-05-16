@@ -1,6 +1,13 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import Sidebar from '../components/Sidebar';
+import OpenClawPanel from '../components/OpenClawPanel';
+import SecurityCenter from '../components/SecurityCenter';
+import DiagnosticsPanel from '../components/DiagnosticsPanel';
+import SkillManager from '../components/SkillManager';
+import ToolActivityPanel from '../components/ToolActivityPanel';
+import AgentRunTimeline from '../components/AgentRunTimeline';
 
 const API = process.env.NEXT_PUBLIC_API_URL ||
   (typeof window !== 'undefined'
@@ -9,7 +16,12 @@ const API = process.env.NEXT_PUBLIC_API_URL ||
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
-type Mode = 'agent' | 'chat' | 'studio' | 'knowledge' | 'connectors';
+type Mode =
+  | 'agent' | 'chat' | 'studio' | 'knowledge' | 'connectors'
+  | 'openclaw' | 'security' | 'diagnostics' | 'tools' | 'runs';
+
+type StudioTab = 'generate' | 'library' | 'import';
+
 type ChatMessage = { role: 'user' | 'assistant'; content: string; ragSources?: string[] };
 type Agent = { name: string; description: string; default_output: string; default_skill: string; system_addendum?: string; allowed_tools?: string[] };
 type AgentMap = Record<string, Agent>;
@@ -74,7 +86,7 @@ const DEFAULT_SETTINGS: Settings = {
 // ════════════════════════════════════════════════════════════════════════════
 export default function Home() {
   // ── Core state ────────────────────────────────────────────────────────────
-  const [mode, setMode] = useState<Mode>('agent');
+  const [mode, setMode] = useState<Mode>('chat');
   const [model, setModel] = useState('');
   const [models, setModels] = useState<string[]>([]);
   const [skills, setSkills] = useState<string[]>([]);
@@ -86,10 +98,12 @@ export default function Home() {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
+  // ── OpenClaw status (sidebar live indicator) ──────────────────────────────
+  const [openClawRunning, setOpenClawRunning] = useState(false);
+
   // ── Agent mode ────────────────────────────────────────────────────────────
   const [agentPrompt, setAgentPrompt] = useState('Analyze the uploaded context and create an executive-ready deliverable.');
   const [studioPrompt, setStudioPrompt] = useState('Generate output using the selected skill.');
-  // Unified accessor so generate() works for both tabs
   const prompt = mode === 'studio' ? studioPrompt : agentPrompt;
   const setPrompt = mode === 'studio' ? setStudioPrompt : setAgentPrompt;
   const [outputType, setOutputType] = useState('docx');
@@ -109,10 +123,18 @@ export default function Home() {
 
   // ── Studio mode ───────────────────────────────────────────────────────────
   const [skillName, setSkillName] = useState('document_writer');
+  const [studioTab, setStudioTab] = useState<StudioTab>('generate');
   const [showSkillCreator, setShowSkillCreator] = useState(false);
   const [newSkillName, setNewSkillName] = useState('');
   const [newSkillDesc, setNewSkillDesc] = useState('');
   const [newSkillRules, setNewSkillRules] = useState(['', '', '']);
+  // Skill import
+  const [importContent, setImportContent] = useState('');
+  const [importGithubUrl, setImportGithubUrl] = useState('');
+  const [importZipFile, setImportZipFile] = useState<File | null>(null);
+  const [importLoading, setImportLoading] = useState(false);
+  const [importResult, setImportResult] = useState<any>(null);
+  const [skillDetails, setSkillDetails] = useState<Record<string, any>>({});
 
   // ── Knowledge Base ────────────────────────────────────────────────────────
   const [kbDocs, setKbDocs] = useState<KbDoc[]>([]);
@@ -183,16 +205,31 @@ export default function Home() {
   useEffect(() => {
     if (mode === 'knowledge') refreshKnowledgeBase();
     if (mode === 'connectors') { refreshMcpServers(); fetchMcpPresets(); }
-  }, [mode, kbCollection]);
+    if (mode === 'studio' && studioTab === 'library') fetchSkillDetails();
+  }, [mode, kbCollection, studioTab]);
+
+  // Poll OpenClaw status for sidebar indicator
+  const pollOpenClaw = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/openclaw/status`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setOpenClawRunning(!!data.running);
+    } catch { /* silent */ }
+  }, []);
+
+  useEffect(() => {
+    pollOpenClaw();
+    const t = setInterval(pollOpenClaw, 15000);
+    return () => clearInterval(t);
+  }, [pollOpenClaw]);
 
   // ── Data fetching ─────────────────────────────────────────────────────────
 
   function refreshAll() {
     fetch(`${API}/agents`).then(r => r.json()).then(d => setAgents(d.agents || {})).catch(() => {});
     fetch(`${API}/agent/runs`).then(r => r.json()).then(d => setRuns(d.runs || [])).catch(() => {});
-    fetch(`${API}/health`).then(r => r.json()).then(d => {
-      setHealth(d);
-    }).catch(() => {});
+    fetch(`${API}/health`).then(r => r.json()).then(d => setHealth(d)).catch(() => {});
     fetch(`${API}/models`).then(r => r.json()).then(d => {
       const installed: string[] = d.models || [];
       setModels(installed);
@@ -208,6 +245,17 @@ export default function Home() {
       if (!cols.includes('default')) cols.unshift('default');
       setKbCollections(cols);
     }).catch(() => {});
+  }
+
+  async function fetchSkillDetails() {
+    const details: Record<string, any> = {};
+    for (const s of skills) {
+      try {
+        const res = await fetch(`${API}/skills/${s}`);
+        if (res.ok) details[s] = await res.json();
+      } catch {}
+    }
+    setSkillDetails(details);
   }
 
   function refreshKnowledgeBase() {
@@ -322,7 +370,7 @@ export default function Home() {
     }
   }
 
-  // ── Generate (agent/studio) ───────────────────────────────────────────────
+  // ── Generate ──────────────────────────────────────────────────────────────
 
   async function generate() {
     setLoading(true); setError(''); setDownloadUrl(''); setRawMarkdown('');
@@ -381,7 +429,6 @@ export default function Home() {
     if (files) Array.from(files).forEach(f => form.append('files', f));
 
     if (streamEnabled) {
-      // Add placeholder for streaming response
       setChatMessages([...nextHistory, { role: 'assistant', content: '' }]);
       let accumulated = '';
       let ragSources: string[] = [];
@@ -449,7 +496,7 @@ export default function Home() {
     }
   }
 
-  // ── Skill creator ─────────────────────────────────────────────────────────
+  // ── Skill CRUD ────────────────────────────────────────────────────────────
 
   async function createSkill() {
     if (!newSkillName.trim() || !newSkillDesc.trim()) return;
@@ -473,6 +520,109 @@ export default function Home() {
     }
   }
 
+  async function deleteSkill(name: string) {
+    if (!await confirmAction(`Delete skill "${name}"?`)) return;
+    try {
+      const res = await fetch(`${API}/skills/${name}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Delete failed');
+      setSkills(prev => prev.filter(s => s !== name));
+      if (skillName === name) setSkillName(skills.find(s => s !== name) || '');
+      setSuccess(`Skill "${name}" deleted`);
+      fetchSkillDetails();
+    } catch (e: any) {
+      setError(e.message);
+    }
+  }
+
+  // ── Skill import ──────────────────────────────────────────────────────────
+
+  async function importSkillFromContent() {
+    if (!importContent.trim()) return;
+    setImportLoading(true);
+    setImportResult(null);
+    try {
+      const res = await fetch(`${API}/openclaw/import-skills`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: importContent, source: 'pasted' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Import failed');
+      setImportResult(data);
+      setImportContent('');
+      setSuccess('Skill imported!');
+      fetch(`${API}/skills`).then(r => r.json()).then(d => setSkills(d.skills || [])).catch(() => {});
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setImportLoading(false);
+    }
+  }
+
+  async function importFromGithub() {
+    if (!importGithubUrl.trim()) return;
+    setImportLoading(true);
+    setImportResult(null);
+    try {
+      const res = await fetch(`${API}/openclaw/import-skills`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ github_url: importGithubUrl, source: 'github' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Import failed');
+      setImportResult(data);
+      setImportGithubUrl('');
+      setSuccess('Skills imported from GitHub!');
+      fetch(`${API}/skills`).then(r => r.json()).then(d => setSkills(d.skills || [])).catch(() => {});
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setImportLoading(false);
+    }
+  }
+
+  async function importFromZip() {
+    if (!importZipFile) return;
+    setImportLoading(true);
+    setImportResult(null);
+    try {
+      const form = new FormData();
+      form.append('file', importZipFile);
+      const res = await fetch(`${API}/openclaw/import-skills`, { method: 'POST', body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Import failed');
+      setImportResult(data);
+      setImportZipFile(null);
+      setSuccess('Skills imported from ZIP!');
+      fetch(`${API}/skills`).then(r => r.json()).then(d => setSkills(d.skills || [])).catch(() => {});
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setImportLoading(false);
+    }
+  }
+
+  async function importOpenClawSkills() {
+    setImportLoading(true);
+    setImportResult(null);
+    try {
+      const res = await fetch(`${API}/openclaw/import-skills`, { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: 'openclaw_vendor' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Import failed');
+      setImportResult(data);
+      setSuccess('OpenClaw skills imported!');
+      fetch(`${API}/skills`).then(r => r.json()).then(d => setSkills(d.skills || [])).catch(() => {});
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setImportLoading(false);
+    }
+  }
+
   // ── Knowledge Base ────────────────────────────────────────────────────────
 
   async function uploadKbFiles() {
@@ -487,9 +637,7 @@ export default function Home() {
       if (!res.ok) throw new Error(data.detail || 'Upload failed');
       const ok = (data.results as any[]).filter(r => r.chunks > 0);
       const failed = (data.results as any[]).filter(r => r.chunks === 0 && r.error);
-      if (failed.length > 0) {
-        setError(`${failed.length} file(s) failed to embed: ${failed.map((r: any) => `${r.filename} (${r.error})`).join(', ')}`);
-      }
+      if (failed.length > 0) setError(`${failed.length} file(s) failed: ${failed.map((r: any) => r.filename).join(', ')}`);
       if (ok.length > 0) setSuccess(`Indexed ${ok.length} file(s) into "${kbCollection}"`);
       setKbFiles(null);
       refreshKnowledgeBase();
@@ -506,9 +654,7 @@ export default function Home() {
       await fetch(`${API}/knowledge-base/${kbCollection}/documents/${encodeURIComponent(filename)}`, { method: 'DELETE' });
       setSuccess('Document removed');
       refreshKnowledgeBase();
-    } catch (e: any) {
-      setError(e.message);
-    }
+    } catch (e: any) { setError(e.message); }
   }
 
   async function createNewCollection() {
@@ -545,9 +691,7 @@ export default function Home() {
     };
     try {
       const res = await fetch(`${API}/mcp/servers`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
       });
       if (!res.ok) throw new Error('Add failed');
       setSuccess(`MCP server "${data.name}" added`);
@@ -558,7 +702,7 @@ export default function Home() {
   }
 
   async function deleteMcpServer(id: string) {
-    if (!confirmAction('Remove this MCP server?')) return;
+    if (!await confirmAction('Remove this MCP server?')) return;
     try {
       const res = await fetch(`${API}/mcp/servers/${id}`, { method: 'DELETE' });
       if (!res.ok) {
@@ -590,12 +734,20 @@ export default function Home() {
   const hasContext = !!(githubUrl || (files && files.length > 0));
   const providerLabel = health?.provider ? health.provider.charAt(0).toUpperCase() + health.provider.slice(1) : 'Ollama';
 
+  // ── Sidebar navigation maps ───────────────────────────────────────────────
+
+  // Panels that use the new component system (no embedded toolbar)
+  const NEW_PANELS: Mode[] = ['openclaw', 'security', 'diagnostics', 'tools', 'runs'];
+  const isNewPanel = NEW_PANELS.includes(mode);
+
   // ════════════════════════════════════════════════════════════════════════════
   // RENDER
   // ════════════════════════════════════════════════════════════════════════════
 
   return (
-    <main className="container">
+    <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg)' }}>
+
+      {/* ── Global overlays ──────────────────────────────────────────────── */}
       {success && <div className="toast toast-success">✓ {success}</div>}
 
       {confirmState && (
@@ -606,7 +758,7 @@ export default function Home() {
         />
       )}
 
-      {/* ── Settings Modal ─────────────────────────────────────────────── */}
+      {/* ── Settings Modal ────────────────────────────────────────────── */}
       {settingsOpen && (
         <div className="modal-overlay" onClick={() => setSettingsOpen(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
@@ -619,17 +771,14 @@ export default function Home() {
                 <label className="settings-label">LLM Provider</label>
                 <div className="provider-grid">
                   {['ollama', 'claude', 'openai', 'openai_compat'].map(p => (
-                    <button
-                      key={p}
+                    <button key={p}
                       className={settingsDraft.llm_provider === p ? 'provider-btn active' : 'provider-btn'}
-                      onClick={() => setSettingsDraft(d => ({ ...d, llm_provider: p }))}
-                    >
+                      onClick={() => setSettingsDraft(d => ({ ...d, llm_provider: p }))}>
                       {p === 'ollama' ? '🦙 Ollama' : p === 'claude' ? '🟣 Claude' : p === 'openai' ? '🟢 OpenAI' : '⚙ OpenAI-Compat'}
                     </button>
                   ))}
                 </div>
               </div>
-
               {settingsDraft.llm_provider === 'ollama' && (
                 <div className="settings-section">
                   <div className="row"><label>Ollama URL</label>
@@ -640,7 +789,6 @@ export default function Home() {
                     <input value={settingsDraft.ollama_embedding_model} onChange={e => setSettingsDraft(d => ({ ...d, ollama_embedding_model: e.target.value }))} placeholder="nomic-embed-text" /></div>
                 </div>
               )}
-
               {settingsDraft.llm_provider === 'claude' && (
                 <div className="settings-section">
                   <div className="row"><label>API Key</label>
@@ -653,7 +801,6 @@ export default function Home() {
                     </select></div>
                 </div>
               )}
-
               {(settingsDraft.llm_provider === 'openai' || settingsDraft.llm_provider === 'openai_compat') && (
                 <div className="settings-section">
                   <div className="row"><label>API Key</label>
@@ -664,13 +811,11 @@ export default function Home() {
                     <input value={settingsDraft.openai_base_url} onChange={e => setSettingsDraft(d => ({ ...d, openai_base_url: e.target.value }))} placeholder="http://localhost:1234/v1" /></div>
                 </div>
               )}
-
               <div className="settings-section">
                 <label className="settings-label">GitHub</label>
                 <div className="row"><label>Personal Access Token</label>
                   <input type="password" value={settingsDraft.github_token} onChange={e => setSettingsDraft(d => ({ ...d, github_token: e.target.value }))} placeholder="ghp_..." /></div>
               </div>
-
               <div className="settings-section">
                 <label className="settings-label">Knowledge Base (RAG)</label>
                 <div className="grid">
@@ -725,15 +870,11 @@ export default function Home() {
                     const checked = (editingAgent.allowed_tools || []).includes(tool);
                     return (
                       <label key={tool} className="tool-checkbox">
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={() => {
-                            const current = editingAgent.allowed_tools || [];
-                            const next = checked ? current.filter(t => t !== tool) : [...current, tool];
-                            setEditingAgent(a => a ? { ...a, allowed_tools: next } : a);
-                          }}
-                        />
+                        <input type="checkbox" checked={checked} onChange={() => {
+                          const current = editingAgent.allowed_tools || [];
+                          const next = checked ? current.filter(t => t !== tool) : [...current, tool];
+                          setEditingAgent(a => a ? { ...a, allowed_tools: next } : a);
+                        }} />
                         <span>{tool}</span>
                       </label>
                     );
@@ -749,575 +890,752 @@ export default function Home() {
         </div>
       )}
 
-      {/* ── Header ────────────────────────────────────────────────────── */}
-      <div className="hero">
-        <div>
-          <div className="hero-badge">Local AI</div>
-          <h1>Agent Studio</h1>
-          <p className="muted">Multi-provider AI with agents, skills, MCP tools, and knowledge base.</p>
-        </div>
-        <div className="hero-actions">
-          <div className={health?.ollama_ok || health?.provider !== 'ollama' ? 'status ok' : 'status bad'}>
-            <span className="status-dot" />
-            {providerLabel} {health?.ollama_ok || health?.provider !== 'ollama' ? 'Connected' : 'Offline'}
-          </div>
-          <button className="icon-btn" onClick={refreshAll} title="Refresh">↻</button>
-          <button className="icon-btn" onClick={() => { setSettingsDraft(settings); setSettingsOpen(true); }} title="Settings">⚙</button>
-        </div>
-      </div>
+      {/* ── Sidebar ───────────────────────────────────────────────────────── */}
+      <Sidebar
+        activePanel={mode}
+        onPanelChange={p => setMode(p as Mode)}
+        openClawRunning={openClawRunning}
+      />
 
-      {/* ── Tabs ──────────────────────────────────────────────────────── */}
-      <div className="tabs">
-        {([['agent', '⚡', 'Agent Mode'], ['chat', '💬', 'Chat'], ['studio', '🛠', 'Skill Studio'], ['knowledge', '📚', 'Knowledge Base'], ['connectors', '🔌', 'Connectors']] as [Mode, string, string][]).map(([m, icon, label]) => (
-          <button key={m} className={mode === m ? 'tab active' : 'tab'} onClick={() => setMode(m)}>
-            <span className="tab-icon">{icon}</span> {label}
-          </button>
-        ))}
-      </div>
+      {/* ── Main content ──────────────────────────────────────────────────── */}
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflowX: 'hidden' }}>
 
-      <div className="layout">
-        <section className="card maincard">
-
-          {/* ── Model selector (always visible) ───────────────────────── */}
-          {mode !== 'knowledge' && mode !== 'connectors' && (
-            <div className="grid">
-              <div className="row">
-                <label>Model</label>
+        {/* ── Top header bar ─────────────────────────────────────────────── */}
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '12px 28px', background: 'var(--surface)',
+          borderBottom: '1px solid var(--border)', gap: 16, flexShrink: 0,
+        }}>
+          {/* Left: provider + model */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div className={`status ${health?.ollama_ok || health?.provider !== 'ollama' ? 'ok' : 'bad'}`}
+              style={{ fontSize: 12, padding: '5px 10px' }}>
+              <span className="status-dot" />
+              {providerLabel} {health?.ollama_ok || health?.provider !== 'ollama' ? 'Connected' : 'Offline'}
+            </div>
+            {!isNewPanel && (
+              <>
                 {settings.llm_provider === 'ollama' ? (
                   models.length > 0 ? (
-                    <select value={model} onChange={e => setModel(e.target.value)}>
+                    <select value={model} onChange={e => setModel(e.target.value)}
+                      style={{ padding: '5px 10px', fontSize: 13, borderRadius: 8, border: '1.5px solid var(--border)', background: 'var(--surface)' }}>
                       {models.map(m => <option key={m} value={m}>{m}</option>)}
                     </select>
                   ) : (
-                    <input value={model} onChange={e => setModel(e.target.value)} placeholder={health?.default_model || 'Model name'} />
+                    <input value={model} onChange={e => setModel(e.target.value)}
+                      placeholder="Model name"
+                      style={{ padding: '5px 10px', fontSize: 13, borderRadius: 8, border: '1.5px solid var(--border)', width: 180 }} />
                   )
                 ) : (
-                  <div className="provider-model-badge">
-                    <span className="agent-badge" style={{ fontSize: 12, padding: '4px 10px' }}>
-                      {settings.llm_provider === 'claude' ? settings.claude_model : settings.openai_model}
-                    </span>
-                    <span className="muted small">configured in Settings</span>
-                  </div>
+                  <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 600 }}>
+                    {settings.llm_provider === 'claude' ? settings.claude_model : settings.openai_model}
+                  </span>
                 )}
-              </div>
-              <div className="row">
-                <label>Active Agent</label>
-                <select value={agentId} onChange={e => applyAgent(e.target.value)}>
-                  {Object.entries(agents).map(([id, a]) => (
-                    <option key={id} value={id}>{a.name}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-          )}
-
-          {/* ══════════════════════════ AGENT TAB ═══════════════════════ */}
-          {mode === 'agent' && (
-            <>
-              {/* Agent creation panel */}
-              <div className="builder">
-                <div className="builder-header">
-                  <span className="builder-icon">✨</span>
-                  <strong>Create Agent from Prompt</strong>
-                </div>
-                <textarea
-                  className="smallArea"
-                  value={createPrompt}
-                  onChange={e => setCreatePrompt(e.target.value)}
-                  placeholder="Describe the agent you want to create…"
-                />
-                <button className="secondary" onClick={createAgentFromPrompt} disabled={creatingAgent || !createPrompt.trim()}>
-                  {creatingAgent ? <><span className="spinner" /> Creating…</> : '✨ Create Agent'}
-                </button>
-              </div>
-
-              {/* Agent grid */}
-              <label>Available Agents</label>
-              <div className="agentGrid">
-                {Object.entries(agents).map(([id, agent]) => (
-                  <div key={id} className={agentId === id ? 'agent activeAgent agent-card' : 'agent agent-card'} onClick={() => applyAgent(id)}>
-                    <div className="agent-header">
-                      <strong>{agent.name}</strong>
-                      <span className="agent-badge">{agent.default_output}</span>
-                    </div>
-                    <span className="agent-desc">{agent.description}</span>
-                    <div className="agent-actions" onClick={e => e.stopPropagation()}>
-                      <button className="agent-action-btn" onClick={() => { setEditingAgentId(id); setEditingAgent({ ...agent }); }}>✏ Edit</button>
-                      <button className="agent-action-btn danger" onClick={() => deleteAgent(id)}>✕ Delete</button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {selectedAgent && (
-                <p className="muted small agent-meta">
-                  Skill: <strong>{selectedAgent.default_skill}</strong> · Output: <strong>{selectedAgent.default_output.toUpperCase()}</strong>
-                </p>
-              )}
-
-              <div className="row"><label>Prompt</label>
-                <textarea value={prompt} onChange={e => setPrompt(e.target.value)} /></div>
-              <div className="grid">
-                <div className="row"><label>Output Format</label>
-                  <select value={outputType} onChange={e => setOutputType(e.target.value)}>
-                    <option value="docx">Word Document (.docx)</option>
-                    <option value="pptx">PowerPoint (.pptx)</option>
-                    <option value="md">Markdown (.md)</option>
+                {(mode === 'agent' || mode === 'chat' || mode === 'studio') && (
+                  <select value={agentId} onChange={e => applyAgent(e.target.value)}
+                    style={{ padding: '5px 10px', fontSize: 13, borderRadius: 8, border: '1.5px solid var(--border)', background: 'var(--surface)' }}>
+                    {Object.entries(agents).map(([id, a]) => (
+                      <option key={id} value={id}>{a.name}</option>
+                    ))}
                   </select>
-                </div>
-                <div className="row"><label>Knowledge Base Collection</label>
-                  <div className="rag-toggle-row">
-                    <label className="toggle-label">
-                      <input type="checkbox" checked={useRag} onChange={e => setUseRag(e.target.checked)} />
-                      <span>Use RAG</span>
-                    </label>
-                    {useRag && (
-                      <select value={ragCollection} onChange={e => setRagCollection(e.target.value)}>
-                        {kbCollections.map(c => <option key={c} value={c}>{c}</option>)}
-                      </select>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </>
-          )}
-
-          {/* ══════════════════════════ CHAT TAB ════════════════════════ */}
-          {mode === 'chat' && (
-            <div className="chatBox">
-              <div className="chatHeader">
-                <div className="chatHeader-left">
-                  <span className="chat-avatar">🤖</span>
-                  <div>
-                    <strong>{selectedAgent ? selectedAgent.name : 'General Chat'}</strong>
-                    <div className="chatHeader-sub">{providerLabel} · {model || 'default'}</div>
-                  </div>
-                </div>
-                <div className="chat-controls">
-                  <label className="toggle-label small">
-                    <input type="checkbox" checked={streamEnabled} onChange={e => setStreamEnabled(e.target.checked)} />
-                    <span>Stream</span>
-                  </label>
-                  <label className="toggle-label small">
-                    <input type="checkbox" checked={useRag} onChange={e => setUseRag(e.target.checked)} />
-                    <span>RAG</span>
-                  </label>
-                  {chatMessages.length > 0 && (
-                    <button className="clear-btn" onClick={() => setChatMessages([])}>Clear</button>
-                  )}
-                </div>
-              </div>
-
-              <div className="messages">
-                {chatMessages.length === 0 && (
-                  <div className="chat-empty">
-                    <div className="chat-empty-icon">💬</div>
-                    <p>Start a conversation with {selectedAgent?.name || 'the assistant'}.</p>
-                    <p className="muted small">Ctrl+Enter to send · Toggle Stream for real-time output · Toggle RAG to use uploaded documents</p>
-                  </div>
                 )}
-                {chatMessages.map((m, idx) => (
-                  <div key={idx} className={m.role === 'user' ? 'bubble userBubble' : 'bubble assistantBubble'}>
-                    <strong>{m.role === 'user' ? 'You' : (selectedAgent?.name || 'Assistant')}</strong>
-                    <div dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }} />
-                    {m.ragSources && m.ragSources.length > 0 && (
-                      <div className="rag-sources">
-                        📚 Sources: {m.ragSources.map(s => <span key={s} className="rag-chip">{s}</span>)}
+              </>
+            )}
+          </div>
+          {/* Right: refresh + settings */}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="icon-btn" onClick={refreshAll} title="Refresh">↻</button>
+            <button className="icon-btn" onClick={() => { setSettingsDraft(settings); setSettingsOpen(true); }} title="Settings">⚙</button>
+          </div>
+        </div>
+
+        {/* ── Panel content ─────────────────────────────────────────────── */}
+        <div style={{ flex: 1, padding: '24px 28px 40px', overflowY: 'auto' }}>
+
+          {/* ── NEW: Delegated to component panels ──────────────────────── */}
+          {mode === 'openclaw'    && <OpenClawPanel apiBase={API} />}
+          {mode === 'security'   && <SecurityCenter apiBase={API} />}
+          {mode === 'diagnostics'&& <DiagnosticsPanel apiBase={API} />}
+          {mode === 'tools'      && <ToolActivityPanel apiBase={API} />}
+          {mode === 'runs'       && <AgentRunTimeline apiBase={API} />}
+
+          {/* ── EXISTING: inline panels ───────────────────────────────── */}
+          {!isNewPanel && (
+            <div className="layout">
+              <section className="card maincard">
+
+                {/* ════════════════ AGENT TAB ════════════════════════════ */}
+                {mode === 'agent' && (
+                  <>
+                    <div className="builder">
+                      <div className="builder-header">
+                        <span className="builder-icon">✨</span>
+                        <strong>Create Agent from Prompt</strong>
                       </div>
-                    )}
-                  </div>
-                ))}
-                {loading && !streamEnabled && (
-                  <div className="bubble assistantBubble">
-                    <strong>{selectedAgent?.name || 'Assistant'}</strong>
-                    <div className="typing-dots"><span /><span /><span /></div>
-                  </div>
-                )}
-                <div ref={messagesEndRef} />
-              </div>
-
-              <div className="chatInput">
-                <textarea
-                  className="smallArea"
-                  placeholder="Type your message… (Ctrl+Enter to send)"
-                  value={chatInput}
-                  onChange={e => setChatInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendChat(); }}
-                />
-                <button className="primary" onClick={sendChat} disabled={loading || !chatInput.trim()}>
-                  {loading ? <span className="spinner white" /> : 'Send'}
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* ═══════════════════════ SKILL STUDIO TAB ═══════════════════ */}
-          {mode === 'studio' && (
-            <>
-              <div className="skill-header">
-                <div className="row" style={{ flex: 1 }}>
-                  <label>Skill</label>
-                  <select value={skillName} onChange={e => setSkillName(e.target.value)}>
-                    {skills.map(s => <option key={s} value={s}>{s}</option>)}
-                  </select>
-                </div>
-                <button className="secondary" style={{ marginTop: 20 }} onClick={() => setShowSkillCreator(v => !v)}>
-                  {showSkillCreator ? 'Cancel' : '+ New Skill'}
-                </button>
-              </div>
-
-              {showSkillCreator && (
-                <div className="builder">
-                  <div className="builder-header"><span className="builder-icon">🛠</span><strong>Create New Skill</strong></div>
-                  <div className="row"><label>Skill Name (slug)</label>
-                    <input value={newSkillName} onChange={e => setNewSkillName(e.target.value)} placeholder="my_skill" /></div>
-                  <div className="row"><label>Description (one sentence)</label>
-                    <input value={newSkillDesc} onChange={e => setNewSkillDesc(e.target.value)} placeholder="What this skill does…" /></div>
-                  <label>Rules</label>
-                  {newSkillRules.map((rule, i) => (
-                    <div key={i} className="rule-row">
-                      <input value={rule} onChange={e => setNewSkillRules(rs => rs.map((r, j) => j === i ? e.target.value : r))}
-                        placeholder={`Rule ${i + 1}…`} />
-                      {newSkillRules.length > 1 && (
-                        <button className="icon-btn" onClick={() => setNewSkillRules(rs => rs.filter((_, j) => j !== i))}>✕</button>
-                      )}
+                      <textarea className="smallArea" value={createPrompt} onChange={e => setCreatePrompt(e.target.value)}
+                        placeholder="Describe the agent you want to create…" />
+                      <button className="secondary" onClick={createAgentFromPrompt} disabled={creatingAgent || !createPrompt.trim()}>
+                        {creatingAgent ? <><span className="spinner" /> Creating…</> : '✨ Create Agent'}
+                      </button>
                     </div>
-                  ))}
-                  <button className="secondary small-btn" onClick={() => setNewSkillRules(rs => [...rs, ''])}>+ Add Rule</button>
-                  <button className="primary" onClick={createSkill} disabled={!newSkillName.trim() || !newSkillDesc.trim()}>Create Skill</button>
-                </div>
-              )}
 
-              <div className="row"><label>Prompt</label>
-                <textarea value={prompt} onChange={e => setPrompt(e.target.value)} /></div>
-              <div className="grid">
-                <div className="row"><label>Output Format</label>
-                  <select value={outputType} onChange={e => setOutputType(e.target.value)}>
-                    <option value="docx">Word Document (.docx)</option>
-                    <option value="pptx">PowerPoint (.pptx)</option>
-                    <option value="md">Markdown (.md)</option>
-                  </select>
-                </div>
-                <div className="row"><label>RAG</label>
-                  <div className="rag-toggle-row">
-                    <label className="toggle-label">
-                      <input type="checkbox" checked={useRag} onChange={e => setUseRag(e.target.checked)} />
-                      <span>Use Knowledge Base</span>
-                    </label>
-                  </div>
-                </div>
-              </div>
-            </>
-          )}
-
-          {/* ════════════════════ KNOWLEDGE BASE TAB ════════════════════ */}
-          {mode === 'knowledge' && (
-            <div className="kb-tab">
-              <div className="kb-header">
-                <h2>📚 Knowledge Base</h2>
-                <p className="muted">Upload documents to enable semantic search (RAG) across your agents and chat.</p>
-              </div>
-
-              {/* Collection selector */}
-              <div className="kb-collections">
-                <label>Collection</label>
-                <div className="collection-row">
-                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
-                    <select value={kbCollection} onChange={e => { setKbCollection(e.target.value); }} style={{ flex: 1 }}>
-                      {kbCollections.map(c => <option key={c} value={c}>{c}</option>)}
-                    </select>
-                    {kbCollection !== 'default' && (
-                      <button
-                        className="agent-action-btn danger"
-                        title="Delete this collection"
-                        onClick={async () => {
-                          if (!await confirmAction(`Delete collection "${kbCollection}" and all its documents?`)) return;
-                          try {
-                            const res = await fetch(`${API}/knowledge-base/collections/${encodeURIComponent(kbCollection)}`, { method: 'DELETE' });
-                            if (!res.ok) {
-                              const d = await res.json().catch(() => ({ detail: 'Delete failed' }));
-                              throw new Error(d.detail || 'Delete failed');
-                            }
-                            setKbCollections(prev => prev.filter(c => c !== kbCollection));
-                            setKbCollection('default');
-                            setSuccess(`Collection "${kbCollection}" deleted`);
-                          } catch (e: any) { setError(e.message); }
-                        }}
-                      >✕ Delete</button>
-                    )}
-                  </div>
-                  <div className="new-collection-row">
-                    <input value={newCollectionName} onChange={e => setNewCollectionName(e.target.value)}
-                      placeholder="New collection name…" onKeyDown={e => e.key === 'Enter' && createNewCollection()} />
-                    <button className="secondary" onClick={createNewCollection} disabled={!newCollectionName.trim()}>+ Create</button>
-                  </div>
-                </div>
-              </div>
-
-              {/* File upload */}
-              <div className="kb-upload-area">
-                <div className="file-upload">
-                  <input type="file" multiple id="kb-file-input" accept=".txt,.md,.pdf,.py,.js,.ts,.json,.csv,.yaml,.yml"
-                    onChange={e => setKbFiles(e.target.files)} />
-                  <label htmlFor="kb-file-input" className="file-label kb-file-label">
-                    📎 {kbFiles && kbFiles.length > 0
-                      ? `${kbFiles.length} file${kbFiles.length > 1 ? 's' : ''} selected`
-                      : 'Choose files to embed (txt, md, py, js, json, csv…)'}
-                  </label>
-                </div>
-                <button className="primary" onClick={uploadKbFiles} disabled={kbLoading || !kbFiles || kbFiles.length === 0}>
-                  {kbLoading ? <><span className="spinner white" /> Indexing…</> : '⬆ Embed & Index'}
-                </button>
-              </div>
-
-              {/* Document list */}
-              <div className="kb-docs">
-                <div className="kb-docs-header">
-                  <strong>Indexed Documents</strong>
-                  <span className="run-count">{kbDocs.length}</span>
-                  <button className="icon-btn" onClick={refreshKnowledgeBase} style={{ marginLeft: 8 }}>↻</button>
-                </div>
-                {kbLoading && <div className="muted">Loading…</div>}
-                {!kbLoading && kbDocs.length === 0 && (
-                  <div className="kb-empty">
-                    <p className="muted">No documents indexed yet. Upload files above to get started.</p>
-                    <p className="muted small">Tip: Enable "RAG" toggle in Chat or Agent mode to use indexed documents.</p>
-                  </div>
-                )}
-                {kbDocs.map(doc => (
-                  <div key={doc.filename} className="kb-doc-item">
-                    <div className="kb-doc-info">
-                      <span className="kb-doc-name">📄 {doc.filename}</span>
-                      <span className="kb-doc-chunks">{doc.chunk_count} chunks</span>
+                    <label>Available Agents</label>
+                    <div className="agentGrid">
+                      {Object.entries(agents).map(([id, agent]) => (
+                        <div key={id} className={agentId === id ? 'agent activeAgent agent-card' : 'agent agent-card'} onClick={() => applyAgent(id)}>
+                          <div className="agent-header">
+                            <strong>{agent.name}</strong>
+                            <span className="agent-badge">{agent.default_output}</span>
+                          </div>
+                          <span className="agent-desc">{agent.description}</span>
+                          <div className="agent-actions" onClick={e => e.stopPropagation()}>
+                            <button className="agent-action-btn" onClick={() => { setEditingAgentId(id); setEditingAgent({ ...agent }); }}>✏ Edit</button>
+                            <button className="agent-action-btn danger" onClick={() => deleteAgent(id)}>✕ Delete</button>
+                          </div>
+                        </div>
+                      ))}
                     </div>
-                    <button className="agent-action-btn danger" onClick={() => deleteKbDoc(doc.filename)}>✕ Remove</button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* ══════════════════════ CONNECTORS TAB ══════════════════════ */}
-          {mode === 'connectors' && (
-            <div className="connectors-tab">
-              {/* MCP Servers section */}
-              <div className="connector-section">
-                <div className="connector-section-header">
-                  <h2>🔌 MCP Servers</h2>
-                  <div style={{ display: 'flex', gap: 8 }}>
-                    <button className="secondary" onClick={() => setAddMcpOpen(v => !v)}>
-                      {addMcpOpen ? 'Cancel' : '+ Add Server'}
-                    </button>
-                  </div>
-                </div>
-                <p className="muted">Configure MCP (Model Context Protocol) servers to give agents access to tools like GitHub, web search, databases, and more.</p>
-
-                {/* Add server form */}
-                {addMcpOpen && (
-                  <div className="builder">
-                    <div className="builder-header"><span className="builder-icon">🔌</span><strong>Add MCP Server</strong></div>
-
-                    {/* Presets */}
-                    {mcpPresets.length > 0 && (
-                      <div className="preset-grid">
-                        <label className="muted small">Quick presets:</label>
-                        {mcpPresets.map(preset => (
-                          <button key={preset.name} className="preset-btn" onClick={() => addMcpServer(preset)}>
-                            {preset.name}
-                          </button>
-                        ))}
+                    {selectedAgent && (
+                      <p className="muted small agent-meta">
+                        Skill: <strong>{selectedAgent.default_skill}</strong> · Output: <strong>{selectedAgent.default_output.toUpperCase()}</strong>
+                      </p>
+                    )}
+                    <div className="row"><label>Prompt</label>
+                      <textarea value={prompt} onChange={e => setPrompt(e.target.value)} /></div>
+                    <div className="grid">
+                      <div className="row"><label>Output Format</label>
+                        <select value={outputType} onChange={e => setOutputType(e.target.value)}>
+                          <option value="docx">Word Document (.docx)</option>
+                          <option value="pptx">PowerPoint (.pptx)</option>
+                          <option value="md">Markdown (.md)</option>
+                        </select>
                       </div>
-                    )}
-
-                    <div className="row"><label>Name</label>
-                      <input value={newMcp.name} onChange={e => setNewMcp(m => ({ ...m, name: e.target.value }))} placeholder="My MCP Server" /></div>
-                    <div className="row"><label>Command</label>
-                      <input value={newMcp.command} onChange={e => setNewMcp(m => ({ ...m, command: e.target.value }))} placeholder="npx" /></div>
-                    <div className="row"><label>Args (space-separated)</label>
-                      <input value={newMcp.args} onChange={e => setNewMcp(m => ({ ...m, args: e.target.value }))} placeholder="-y @modelcontextprotocol/server-github" /></div>
-                    <div className="row"><label>Env vars (KEY=VALUE, one per line)</label>
-                      <textarea className="smallArea" value={newMcp.env} onChange={e => setNewMcp(m => ({ ...m, env: e.target.value }))} placeholder="GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_TOKEN}" /></div>
-                    <div className="row"><label>Description</label>
-                      <input value={newMcp.description} onChange={e => setNewMcp(m => ({ ...m, description: e.target.value }))} /></div>
-                    <button className="primary" onClick={() => addMcpServer()} disabled={!newMcp.name || !newMcp.command}>Add Server</button>
-                  </div>
+                      <div className="row"><label>Knowledge Base</label>
+                        <div className="rag-toggle-row">
+                          <label className="toggle-label">
+                            <input type="checkbox" checked={useRag} onChange={e => setUseRag(e.target.checked)} />
+                            <span>Use RAG</span>
+                          </label>
+                          {useRag && (
+                            <select value={ragCollection} onChange={e => setRagCollection(e.target.value)}>
+                              {kbCollections.map(c => <option key={c} value={c}>{c}</option>)}
+                            </select>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </>
                 )}
 
-                {/* Server list */}
-                {mcpServers.length === 0 && !addMcpOpen && (
-                  <div className="connector-empty">
-                    <p className="muted">No MCP servers configured.</p>
-                    <p className="muted small">Add servers like GitHub MCP, Brave Search, SQLite, or custom tools to extend agent capabilities.</p>
-                  </div>
-                )}
-                {mcpServers.map(server => (
-                  <div key={server.id} className="mcp-server-card">
-                    <div className="mcp-server-header">
-                      <div className="mcp-server-info">
-                        <div className={mcpTools[server.id] ? 'mcp-server-status-dot connected' : 'mcp-server-status-dot'} />
+                {/* ════════════════ CHAT TAB ═════════════════════════════ */}
+                {mode === 'chat' && (
+                  <div className="chatBox">
+                    <div className="chatHeader">
+                      <div className="chatHeader-left">
+                        <span className="chat-avatar">🤖</span>
                         <div>
-                          <strong>{server.name}</strong>
-                          {server.description && <div className="muted small">{server.description}</div>}
-                          <code className="mcp-command">{server.command} {server.args.join(' ')}</code>
+                          <strong>{selectedAgent ? selectedAgent.name : 'General Chat'}</strong>
+                          <div className="chatHeader-sub">{providerLabel} · {model || 'default'}</div>
                         </div>
                       </div>
-                      <div className="mcp-server-actions">
-                        <button
-                          className="secondary"
-                          onClick={() => listMcpTools(server.id)}
-                          disabled={mcpLoading[server.id]}
-                        >
-                          {mcpLoading[server.id] ? <span className="spinner" /> : '⚡ List Tools'}
-                        </button>
-                        <button className="agent-action-btn danger" onClick={() => deleteMcpServer(server.id)}>✕</button>
+                      <div className="chat-controls">
+                        <label className="toggle-label small">
+                          <input type="checkbox" checked={streamEnabled} onChange={e => setStreamEnabled(e.target.checked)} />
+                          <span>Stream</span>
+                        </label>
+                        <label className="toggle-label small">
+                          <input type="checkbox" checked={useRag} onChange={e => setUseRag(e.target.checked)} />
+                          <span>RAG</span>
+                        </label>
+                        {chatMessages.length > 0 && (
+                          <button className="clear-btn" onClick={() => setChatMessages([])}>Clear</button>
+                        )}
                       </div>
                     </div>
-
-                    {mcpTools[server.id] && (
-                      <div className="mcp-tools">
-                        <div className="muted small" style={{ marginBottom: 6 }}>{mcpTools[server.id].length} tools available:</div>
-                        <div className="mcp-tools-grid">
-                          {mcpTools[server.id].map(tool => (
-                            <div key={tool.name} className="mcp-tool-card">
-                              <strong>{tool.name}</strong>
-                              <span className="muted small">{tool.description}</span>
+                    <div className="messages">
+                      {chatMessages.length === 0 && (
+                        <div className="chat-empty">
+                          <div className="chat-empty-icon">💬</div>
+                          <p>Start a conversation with {selectedAgent?.name || 'the assistant'}.</p>
+                          <p className="muted small">Ctrl+Enter to send · Toggle Stream for real-time output · Toggle RAG to use uploaded documents</p>
+                        </div>
+                      )}
+                      {chatMessages.map((m, idx) => (
+                        <div key={idx} className={m.role === 'user' ? 'bubble userBubble' : 'bubble assistantBubble'}>
+                          <strong>{m.role === 'user' ? 'You' : (selectedAgent?.name || 'Assistant')}</strong>
+                          <div dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }} />
+                          {m.ragSources && m.ragSources.length > 0 && (
+                            <div className="rag-sources">
+                              📚 Sources: {m.ragSources.map(s => <span key={s} className="rag-chip">{s}</span>)}
                             </div>
-                          ))}
+                          )}
                         </div>
-                      </div>
-                    )}
+                      ))}
+                      {loading && !streamEnabled && (
+                        <div className="bubble assistantBubble">
+                          <strong>{selectedAgent?.name || 'Assistant'}</strong>
+                          <div className="typing-dots"><span /><span /><span /></div>
+                        </div>
+                      )}
+                      <div ref={messagesEndRef} />
+                    </div>
+                    <div className="chatInput">
+                      <textarea className="smallArea" placeholder="Type your message… (Ctrl+Enter to send)"
+                        value={chatInput} onChange={e => setChatInput(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendChat(); }} />
+                      <button className="primary" onClick={sendChat} disabled={loading || !chatInput.trim()}>
+                        {loading ? <span className="spinner white" /> : 'Send'}
+                      </button>
+                    </div>
                   </div>
-                ))}
-              </div>
+                )}
 
-              {/* GitHub section */}
-              <div className="connector-section">
-                <div className="connector-section-header">
-                  <h2>🐙 GitHub Connector</h2>
-                  <button className="secondary" onClick={checkGitHub}>Test Connection</button>
-                </div>
-                {!settings.github_token ? (
-                  <p className="muted">Add your GitHub Personal Access Token in <button className="link-btn" onClick={() => { setSettingsDraft(settings); setSettingsOpen(true); }}>Settings</button> to enable private repo access.</p>
-                ) : githubStatus ? (
-                  <div>
-                    {githubStatus.ok ? (
+                {/* ════════════════ SKILL STUDIO TAB ════════════════════ */}
+                {mode === 'studio' && (
+                  <>
+                    {/* Studio sub-tabs */}
+                    <div style={{ display: 'flex', gap: 6, marginBottom: 20,
+                      background: '#f8fafc', borderRadius: 10, padding: 4, width: 'fit-content',
+                      border: '1px solid var(--border)' }}>
+                      {([['generate', '⚡', 'Generate'], ['library', '📚', 'Skills Library'], ['import', '📥', 'Import Skills']] as [StudioTab, string, string][]).map(([t, icon, label]) => (
+                        <button key={t}
+                          onClick={() => setStudioTab(t)}
+                          style={{
+                            border: 'none', borderRadius: 8, padding: '8px 16px', cursor: 'pointer',
+                            fontWeight: 600, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6,
+                            background: studioTab === t ? 'var(--accent)' : 'transparent',
+                            color: studioTab === t ? 'white' : 'var(--text-muted)',
+                            transition: 'background 150ms ease, color 150ms ease',
+                          }}>
+                          {icon} {label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* ── Generate sub-tab ─── */}
+                    {studioTab === 'generate' && (
                       <>
-                        <div className="status ok" style={{ width: 'fit-content', marginBottom: 12 }}>
-                          <span className="status-dot" /> Connected as {githubStatus.login}
+                        <div className="skill-header">
+                          <div className="row" style={{ flex: 1 }}>
+                            <label>Skill</label>
+                            <select value={skillName} onChange={e => setSkillName(e.target.value)}>
+                              {skills.map(s => <option key={s} value={s}>{s}</option>)}
+                            </select>
+                          </div>
+                          <button className="secondary" style={{ marginTop: 20 }} onClick={() => setShowSkillCreator(v => !v)}>
+                            {showSkillCreator ? 'Cancel' : '+ New Skill'}
+                          </button>
                         </div>
-                        {githubRepos.length > 0 && (
-                          <div className="repo-list">
-                            {githubRepos.slice(0, 20).map(repo => (
-                              <div key={repo.full_name} className="repo-item">
-                                <div>
-                                  <strong>{repo.name}</strong>
-                                  {repo.private && <span className="agent-badge" style={{ marginLeft: 6 }}>private</span>}
-                                  {repo.description && <div className="muted small">{repo.description}</div>}
+                        {showSkillCreator && (
+                          <div className="builder">
+                            <div className="builder-header"><span className="builder-icon">🛠</span><strong>Create New Skill</strong></div>
+                            <div className="row"><label>Skill Name (slug)</label>
+                              <input value={newSkillName} onChange={e => setNewSkillName(e.target.value)} placeholder="my_skill" /></div>
+                            <div className="row"><label>Description</label>
+                              <input value={newSkillDesc} onChange={e => setNewSkillDesc(e.target.value)} placeholder="What this skill does…" /></div>
+                            <label>Rules</label>
+                            {newSkillRules.map((rule, i) => (
+                              <div key={i} className="rule-row">
+                                <input value={rule} onChange={e => setNewSkillRules(rs => rs.map((r, j) => j === i ? e.target.value : r))}
+                                  placeholder={`Rule ${i + 1}…`} />
+                                {newSkillRules.length > 1 && (
+                                  <button className="icon-btn" onClick={() => setNewSkillRules(rs => rs.filter((_, j) => j !== i))}>✕</button>
+                                )}
+                              </div>
+                            ))}
+                            <button className="secondary small-btn" onClick={() => setNewSkillRules(rs => [...rs, ''])}>+ Add Rule</button>
+                            <button className="primary" onClick={createSkill} disabled={!newSkillName.trim() || !newSkillDesc.trim()}>Create Skill</button>
+                          </div>
+                        )}
+                        <div className="row"><label>Prompt</label>
+                          <textarea value={prompt} onChange={e => setPrompt(e.target.value)} /></div>
+                        <div className="grid">
+                          <div className="row"><label>Output Format</label>
+                            <select value={outputType} onChange={e => setOutputType(e.target.value)}>
+                              <option value="docx">Word Document (.docx)</option>
+                              <option value="pptx">PowerPoint (.pptx)</option>
+                              <option value="md">Markdown (.md)</option>
+                            </select>
+                          </div>
+                          <div className="row"><label>Knowledge Base</label>
+                            <div className="rag-toggle-row">
+                              <label className="toggle-label">
+                                <input type="checkbox" checked={useRag} onChange={e => setUseRag(e.target.checked)} />
+                                <span>Use RAG</span>
+                              </label>
+                            </div>
+                          </div>
+                        </div>
+                      </>
+                    )}
+
+                    {/* ── Skills Library sub-tab ─── */}
+                    {studioTab === 'library' && (
+                      <div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                          <div>
+                            <h2 style={{ margin: 0 }}>Skills Library</h2>
+                            <p className="muted small">{skills.length} skill{skills.length !== 1 ? 's' : ''} installed</p>
+                          </div>
+                          <div style={{ display: 'flex', gap: 8 }}>
+                            <button className="secondary" style={{ width: 'auto', padding: '8px 14px', fontSize: 13 }}
+                              onClick={() => { fetchSkillDetails(); }}>↻ Refresh</button>
+                            <button className="secondary" style={{ width: 'auto', padding: '8px 14px', fontSize: 13 }}
+                              onClick={() => setStudioTab('import')}>📥 Import Skills</button>
+                          </div>
+                        </div>
+                        {skills.length === 0 ? (
+                          <div style={{ textAlign: 'center', padding: '40px 20px' }}>
+                            <div style={{ fontSize: 40, marginBottom: 12 }}>🧰</div>
+                            <p className="muted">No skills installed yet.</p>
+                            <button className="secondary" style={{ width: 'auto', marginTop: 12 }} onClick={() => setStudioTab('import')}>
+                              Import your first skill
+                            </button>
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                            {skills.map(s => (
+                              <div key={s} style={{
+                                border: '1.5px solid var(--border)', borderRadius: 10,
+                                padding: '12px 16px', background: skillName === s ? 'var(--indigo-light)' : '#fafbfc',
+                                borderColor: skillName === s ? 'var(--indigo)' : 'var(--border)',
+                                cursor: 'pointer', transition: 'all 150ms ease',
+                                display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+                              }} onClick={() => { setSkillName(s); setStudioTab('generate'); }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 0 }}>
+                                  <span style={{ fontSize: 18, flexShrink: 0 }}>🧰</span>
+                                  <div style={{ minWidth: 0 }}>
+                                    <div style={{ fontWeight: 700, fontSize: 13, color: 'var(--text)' }}>{s.replace(/_/g, ' ')}</div>
+                                    <div className="muted small" style={{ fontSize: 11 }}>{s}</div>
+                                  </div>
                                 </div>
-                                <button className="secondary" onClick={() => {
-                                  setGithubUrl(`https://github.com/${repo.full_name}`);
-                                  setMode('agent');
-                                  setContextOpen(true);
-                                  setSuccess(`Repo "${repo.full_name}" set as context`);
-                                }}>Use Repo</button>
+                                <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                                  <span style={{
+                                    fontSize: 10, fontWeight: 700, padding: '2px 7px',
+                                    borderRadius: 999, background: '#e0e7ff', color: '#4f46e5',
+                                  }}>local</span>
+                                  <button className="agent-action-btn"
+                                    onClick={e => { e.stopPropagation(); setSkillName(s); setStudioTab('generate'); }}
+                                    style={{ fontSize: 11 }}>▶ Use</button>
+                                  <button className="agent-action-btn danger"
+                                    onClick={e => { e.stopPropagation(); deleteSkill(s); }}
+                                    style={{ fontSize: 11 }}>✕</button>
+                                </div>
                               </div>
                             ))}
                           </div>
                         )}
-                      </>
-                    ) : (
-                      <div className="error">GitHub connection failed. Check your token in Settings.</div>
+                      </div>
                     )}
-                  </div>
-                ) : (
-                  <p className="muted">Click "Test Connection" to verify your GitHub token and browse your repositories.</p>
-                )}
-              </div>
-            </div>
-          )}
 
-          {/* ── Context sources (agent + studio + chat tabs) ───────────── */}
-          {mode !== 'knowledge' && mode !== 'connectors' && (
-            <div className="sourcePanel">
-              <button className="panel-toggle" onClick={() => setContextOpen(!contextOpen)}>
-                <span>Context Sources {hasContext && <span className="context-badge">●</span>}</span>
-                <span className="toggle-arrow">{contextOpen ? '▲' : '▼'}</span>
-              </button>
-              {contextOpen && (
-                <div className="panel-body">
-                  <div className="grid">
-                    <div className="row"><label>GitHub Repo URL</label>
-                      <input placeholder="https://github.com/user/repo.git" value={githubUrl} onChange={e => setGithubUrl(e.target.value)} /></div>
-                    <div className="row"><label>Branch (optional)</label>
-                      <input placeholder="main" value={githubBranch} onChange={e => setGithubBranch(e.target.value)} /></div>
-                  </div>
-                  <div className="grid">
-                    <div className="row"><label>Include Paths</label>
-                      <input placeholder="backend,src,docs" value={includePaths} onChange={e => setIncludePaths(e.target.value)} /></div>
-                    <div className="row"><label>Exclude Paths</label>
-                      <input value={excludePaths} onChange={e => setExcludePaths(e.target.value)} /></div>
-                  </div>
-                  <div className="row"><label>Upload Files</label>
-                    <div className="file-upload">
-                      <input type="file" multiple id="file-input" onChange={e => setFiles(e.target.files)} />
-                      <label htmlFor="file-input" className="file-label">
-                        📎 {files && files.length > 0 ? `${files.length} file(s) selected` : 'Choose files…'}
-                      </label>
+                    {/* ── Import Skills sub-tab ─── */}
+                    {studioTab === 'import' && (
+                      <div>
+                        <div style={{ marginBottom: 20 }}>
+                          <h2 style={{ margin: '0 0 4px' }}>Import Skills</h2>
+                          <p className="muted small">Import skills from multiple sources. All skills are scanned for security before installation.</p>
+                        </div>
+
+                        {/* Import result banner */}
+                        {importResult && (
+                          <div style={{ padding: '12px 16px', borderRadius: 10, marginBottom: 16,
+                            background: 'var(--green-bg)', border: '1px solid var(--green-border)', color: 'var(--green)' }}>
+                            <strong>Import complete:</strong> {Array.isArray(importResult.results)
+                              ? `${importResult.results.filter((r: any) => r.status === 'installed').length} installed, ${importResult.results.filter((r: any) => r.status === 'quarantined').length} quarantined`
+                              : JSON.stringify(importResult)}
+                          </div>
+                        )}
+
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+                          {/* Paste SKILL.md */}
+                          <div className="builder">
+                            <div className="builder-header"><span className="builder-icon">📋</span><strong>Paste SKILL.md</strong></div>
+                            <p className="muted small" style={{ marginBottom: 10 }}>Paste a SKILL.md file directly. Works with ChatGPT, Claude, Claude Code, or OpenClaw skills.</p>
+                            <textarea value={importContent} onChange={e => setImportContent(e.target.value)}
+                              placeholder={'# My Skill\n\nDescription of what this skill does.\n\n## Rules\n- Rule 1\n- Rule 2'}
+                              style={{ minHeight: 120, fontFamily: 'monospace', fontSize: 12 }} />
+                            <button className="primary" onClick={importSkillFromContent}
+                              disabled={importLoading || !importContent.trim()}
+                              style={{ marginTop: 8 }}>
+                              {importLoading ? <><span className="spinner white" /> Scanning &amp; Installing…</> : '📥 Import Skill'}
+                            </button>
+                          </div>
+
+                          {/* Import from OpenClaw */}
+                          <div className="builder" style={{ borderColor: '#c7d2fe', background: '#f0f4ff' }}>
+                            <div className="builder-header"><span className="builder-icon">🦞</span><strong>Import from OpenClaw</strong></div>
+                            <p className="muted small" style={{ marginBottom: 10 }}>
+                              Import all skills from the vendored OpenClaw runtime ({skills.length} local skills currently installed).
+                            </p>
+                            <div style={{ display: 'flex', gap: 8 }}>
+                              <button className="secondary" onClick={importOpenClawSkills} disabled={importLoading}
+                                style={{ flex: 1 }}>
+                                {importLoading ? <><span className="spinner" /> Importing…</> : '🦞 Import OpenClaw Skills'}
+                              </button>
+                              <button className="secondary" onClick={() => setMode('openclaw')}
+                                style={{ width: 'auto', padding: '11px 14px', fontSize: 13 }}>
+                                Manage Runtime →
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Import from GitHub */}
+                          <div className="builder">
+                            <div className="builder-header"><span className="builder-icon">🐙</span><strong>Import from GitHub</strong></div>
+                            <p className="muted small" style={{ marginBottom: 10 }}>Clone a GitHub repo and import all SKILL.md files found inside.</p>
+                            <div className="row" style={{ marginBottom: 8 }}>
+                              <label>GitHub Repository URL</label>
+                              <input value={importGithubUrl} onChange={e => setImportGithubUrl(e.target.value)}
+                                placeholder="https://github.com/user/skills-repo" />
+                            </div>
+                            <button className="secondary" onClick={importFromGithub}
+                              disabled={importLoading || !importGithubUrl.trim()}>
+                              {importLoading ? <><span className="spinner" /> Cloning &amp; Scanning…</> : '🐙 Import from GitHub'}
+                            </button>
+                          </div>
+
+                          {/* Import from ZIP */}
+                          <div className="builder">
+                            <div className="builder-header"><span className="builder-icon">📦</span><strong>Import from ZIP</strong></div>
+                            <p className="muted small" style={{ marginBottom: 10 }}>Upload a ZIP archive containing skill folders with SKILL.md files.</p>
+                            <div className="file-upload" style={{ marginBottom: 8 }}>
+                              <input type="file" accept=".zip" id="skill-zip-input"
+                                onChange={e => setImportZipFile(e.target.files?.[0] || null)} />
+                              <label htmlFor="skill-zip-input" className="file-label">
+                                📦 {importZipFile ? importZipFile.name : 'Choose a .zip file containing skills…'}
+                              </label>
+                            </div>
+                            <button className="secondary" onClick={importFromZip}
+                              disabled={importLoading || !importZipFile}>
+                              {importLoading ? <><span className="spinner" /> Scanning &amp; Installing…</> : '📦 Install from ZIP'}
+                            </button>
+                          </div>
+
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Generate button (only in generate tab) */}
+                    {studioTab === 'generate' && (
+                      <>
+                        {/* Context sources */}
+                        <div className="sourcePanel">
+                          <button className="panel-toggle" onClick={() => setContextOpen(!contextOpen)}>
+                            <span>Context Sources {hasContext && <span className="context-badge">●</span>}</span>
+                            <span className="toggle-arrow">{contextOpen ? '▲' : '▼'}</span>
+                          </button>
+                          {contextOpen && (
+                            <div className="panel-body">
+                              <div className="grid">
+                                <div className="row"><label>GitHub Repo URL</label>
+                                  <input placeholder="https://github.com/user/repo.git" value={githubUrl} onChange={e => setGithubUrl(e.target.value)} /></div>
+                                <div className="row"><label>Branch (optional)</label>
+                                  <input placeholder="main" value={githubBranch} onChange={e => setGithubBranch(e.target.value)} /></div>
+                              </div>
+                              <div className="row"><label>Upload Files</label>
+                                <div className="file-upload">
+                                  <input type="file" multiple id="studio-file-input" onChange={e => setFiles(e.target.files)} />
+                                  <label htmlFor="studio-file-input" className="file-label">
+                                    📎 {files && files.length > 0 ? `${files.length} file(s) selected` : 'Choose files…'}
+                                  </label>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                        <button className="primary" onClick={generate} disabled={loading} style={{ marginTop: 16 }}>
+                          {loading ? <><span className="spinner white" /> Running…</> : '🛠 Generate'}
+                        </button>
+                      </>
+                    )}
+                  </>
+                )}
+
+                {/* ════════════════ KNOWLEDGE BASE TAB ══════════════════ */}
+                {mode === 'knowledge' && (
+                  <div className="kb-tab">
+                    <div className="kb-header">
+                      <h2>📚 Knowledge Base</h2>
+                      <p className="muted">Upload documents to enable semantic search (RAG) across your agents and chat.</p>
+                    </div>
+                    <div className="kb-collections">
+                      <label>Collection</label>
+                      <div className="collection-row">
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
+                          <select value={kbCollection} onChange={e => setKbCollection(e.target.value)} style={{ flex: 1 }}>
+                            {kbCollections.map(c => <option key={c} value={c}>{c}</option>)}
+                          </select>
+                          {kbCollection !== 'default' && (
+                            <button className="agent-action-btn danger" title="Delete this collection"
+                              onClick={async () => {
+                                if (!await confirmAction(`Delete collection "${kbCollection}" and all its documents?`)) return;
+                                try {
+                                  const res = await fetch(`${API}/knowledge-base/collections/${encodeURIComponent(kbCollection)}`, { method: 'DELETE' });
+                                  if (!res.ok) {
+                                    const d = await res.json().catch(() => ({ detail: 'Delete failed' }));
+                                    throw new Error(d.detail || 'Delete failed');
+                                  }
+                                  setKbCollections(prev => prev.filter(c => c !== kbCollection));
+                                  setKbCollection('default');
+                                  setSuccess(`Collection "${kbCollection}" deleted`);
+                                } catch (e: any) { setError(e.message); }
+                              }}>✕ Delete</button>
+                          )}
+                        </div>
+                        <div className="new-collection-row">
+                          <input value={newCollectionName} onChange={e => setNewCollectionName(e.target.value)}
+                            placeholder="New collection name…" onKeyDown={e => e.key === 'Enter' && createNewCollection()} />
+                          <button className="secondary" onClick={createNewCollection} disabled={!newCollectionName.trim()}>+ Create</button>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="kb-upload-area">
+                      <div className="file-upload">
+                        <input type="file" multiple id="kb-file-input" accept=".txt,.md,.pdf,.py,.js,.ts,.json,.csv,.yaml,.yml"
+                          onChange={e => setKbFiles(e.target.files)} />
+                        <label htmlFor="kb-file-input" className="file-label kb-file-label">
+                          📎 {kbFiles && kbFiles.length > 0 ? `${kbFiles.length} file(s) selected` : 'Choose files to embed…'}
+                        </label>
+                      </div>
+                      <button className="primary" onClick={uploadKbFiles} disabled={kbLoading || !kbFiles || kbFiles.length === 0}>
+                        {kbLoading ? <><span className="spinner white" /> Indexing…</> : '⬆ Embed & Index'}
+                      </button>
+                    </div>
+                    <div className="kb-docs">
+                      <div className="kb-docs-header">
+                        <strong>Indexed Documents</strong>
+                        <span className="run-count">{kbDocs.length}</span>
+                        <button className="icon-btn" onClick={refreshKnowledgeBase} style={{ marginLeft: 8 }}>↻</button>
+                      </div>
+                      {kbLoading && <div className="muted">Loading…</div>}
+                      {!kbLoading && kbDocs.length === 0 && (
+                        <div className="kb-empty">
+                          <p className="muted">No documents indexed yet. Upload files above to get started.</p>
+                        </div>
+                      )}
+                      {kbDocs.map(doc => (
+                        <div key={doc.filename} className="kb-doc-item">
+                          <div className="kb-doc-info">
+                            <span className="kb-doc-name">📄 {doc.filename}</span>
+                            <span className="kb-doc-chunks">{doc.chunk_count} chunks</span>
+                          </div>
+                          <button className="agent-action-btn danger" onClick={() => deleteKbDoc(doc.filename)}>✕ Remove</button>
+                        </div>
+                      ))}
                     </div>
                   </div>
-                </div>
+                )}
+
+                {/* ════════════════ CONNECTORS TAB ══════════════════════ */}
+                {mode === 'connectors' && (
+                  <div className="connectors-tab">
+                    <div className="connector-section">
+                      <div className="connector-section-header">
+                        <h2>🔌 MCP Servers</h2>
+                        <button className="secondary" onClick={() => setAddMcpOpen(v => !v)}>
+                          {addMcpOpen ? 'Cancel' : '+ Add Server'}
+                        </button>
+                      </div>
+                      <p className="muted">Configure MCP servers to give agents access to external tools.</p>
+                      {addMcpOpen && (
+                        <div className="builder">
+                          <div className="builder-header"><span className="builder-icon">🔌</span><strong>Add MCP Server</strong></div>
+                          {mcpPresets.length > 0 && (
+                            <div className="preset-grid">
+                              <label className="muted small">Quick presets:</label>
+                              {mcpPresets.map(preset => (
+                                <button key={preset.name} className="preset-btn" onClick={() => addMcpServer(preset)}>{preset.name}</button>
+                              ))}
+                            </div>
+                          )}
+                          <div className="row"><label>Name</label>
+                            <input value={newMcp.name} onChange={e => setNewMcp(m => ({ ...m, name: e.target.value }))} placeholder="My MCP Server" /></div>
+                          <div className="row"><label>Command</label>
+                            <input value={newMcp.command} onChange={e => setNewMcp(m => ({ ...m, command: e.target.value }))} placeholder="npx" /></div>
+                          <div className="row"><label>Args (space-separated)</label>
+                            <input value={newMcp.args} onChange={e => setNewMcp(m => ({ ...m, args: e.target.value }))} placeholder="-y @modelcontextprotocol/server-github" /></div>
+                          <div className="row"><label>Env vars (KEY=VALUE, one per line)</label>
+                            <textarea className="smallArea" value={newMcp.env} onChange={e => setNewMcp(m => ({ ...m, env: e.target.value }))} /></div>
+                          <div className="row"><label>Description</label>
+                            <input value={newMcp.description} onChange={e => setNewMcp(m => ({ ...m, description: e.target.value }))} /></div>
+                          <button className="primary" onClick={() => addMcpServer()} disabled={!newMcp.name || !newMcp.command}>Add Server</button>
+                        </div>
+                      )}
+                      {mcpServers.length === 0 && !addMcpOpen && (
+                        <div className="connector-empty">
+                          <p className="muted">No MCP servers configured. Add servers to extend agent capabilities.</p>
+                        </div>
+                      )}
+                      {mcpServers.map(server => (
+                        <div key={server.id} className="mcp-server-card">
+                          <div className="mcp-server-header">
+                            <div className="mcp-server-info">
+                              <div className={mcpTools[server.id] ? 'mcp-server-status-dot connected' : 'mcp-server-status-dot'} />
+                              <div>
+                                <strong>{server.name}</strong>
+                                {server.description && <div className="muted small">{server.description}</div>}
+                                <code className="mcp-command">{server.command} {server.args.join(' ')}</code>
+                              </div>
+                            </div>
+                            <div className="mcp-server-actions">
+                              <button className="secondary" onClick={() => listMcpTools(server.id)} disabled={mcpLoading[server.id]}>
+                                {mcpLoading[server.id] ? <span className="spinner" /> : '⚡ List Tools'}
+                              </button>
+                              <button className="agent-action-btn danger" onClick={() => deleteMcpServer(server.id)}>✕</button>
+                            </div>
+                          </div>
+                          {mcpTools[server.id] && (
+                            <div className="mcp-tools">
+                              <div className="muted small" style={{ marginBottom: 6 }}>{mcpTools[server.id].length} tools available:</div>
+                              <div className="mcp-tools-grid">
+                                {mcpTools[server.id].map(tool => (
+                                  <div key={tool.name} className="mcp-tool-card">
+                                    <strong>{tool.name}</strong>
+                                    <span className="muted small">{tool.description}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                    <div className="connector-section">
+                      <div className="connector-section-header">
+                        <h2>🐙 GitHub Connector</h2>
+                        <button className="secondary" onClick={checkGitHub}>Test Connection</button>
+                      </div>
+                      {!settings.github_token ? (
+                        <p className="muted">Add your GitHub Personal Access Token in <button className="link-btn"
+                          onClick={() => { setSettingsDraft(settings); setSettingsOpen(true); }}>Settings</button>.</p>
+                      ) : githubStatus ? (
+                        <div>
+                          {githubStatus.ok ? (
+                            <>
+                              <div className="status ok" style={{ width: 'fit-content', marginBottom: 12 }}>
+                                <span className="status-dot" /> Connected as {githubStatus.login}
+                              </div>
+                              {githubRepos.length > 0 && (
+                                <div className="repo-list">
+                                  {githubRepos.slice(0, 20).map(repo => (
+                                    <div key={repo.full_name} className="repo-item">
+                                      <div>
+                                        <strong>{repo.name}</strong>
+                                        {repo.private && <span className="agent-badge" style={{ marginLeft: 6 }}>private</span>}
+                                        {repo.description && <div className="muted small">{repo.description}</div>}
+                                      </div>
+                                      <button className="secondary" onClick={() => {
+                                        setGithubUrl(`https://github.com/${repo.full_name}`);
+                                        setMode('agent');
+                                        setContextOpen(true);
+                                        setSuccess(`Repo "${repo.full_name}" set as context`);
+                                      }}>Use Repo</button>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            <div className="error">GitHub connection failed. Check your token in Settings.</div>
+                          )}
+                        </div>
+                      ) : (
+                        <p className="muted">Click "Test Connection" to verify your GitHub token.</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* ── Context sources (agent + chat) ────────────────────── */}
+                {(mode === 'agent' || mode === 'chat') && (
+                  <div className="sourcePanel">
+                    <button className="panel-toggle" onClick={() => setContextOpen(!contextOpen)}>
+                      <span>Context Sources {hasContext && <span className="context-badge">●</span>}</span>
+                      <span className="toggle-arrow">{contextOpen ? '▲' : '▼'}</span>
+                    </button>
+                    {contextOpen && (
+                      <div className="panel-body">
+                        <div className="grid">
+                          <div className="row"><label>GitHub Repo URL</label>
+                            <input placeholder="https://github.com/user/repo.git" value={githubUrl} onChange={e => setGithubUrl(e.target.value)} /></div>
+                          <div className="row"><label>Branch (optional)</label>
+                            <input placeholder="main" value={githubBranch} onChange={e => setGithubBranch(e.target.value)} /></div>
+                        </div>
+                        <div className="grid">
+                          <div className="row"><label>Include Paths</label>
+                            <input placeholder="backend,src,docs" value={includePaths} onChange={e => setIncludePaths(e.target.value)} /></div>
+                          <div className="row"><label>Exclude Paths</label>
+                            <input value={excludePaths} onChange={e => setExcludePaths(e.target.value)} /></div>
+                        </div>
+                        <div className="row"><label>Upload Files</label>
+                          <div className="file-upload">
+                            <input type="file" multiple id="file-input" onChange={e => setFiles(e.target.files)} />
+                            <label htmlFor="file-input" className="file-label">
+                              📎 {files && files.length > 0 ? `${files.length} file(s) selected` : 'Choose files…'}
+                            </label>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* ── Run button ────────────────────────────────────────── */}
+                {mode === 'agent' && (
+                  <button className="primary" onClick={generate} disabled={loading} style={{ marginTop: 8 }}>
+                    {loading ? <><span className="spinner white" /> Running…</> : '⚡ Run Agent'}
+                  </button>
+                )}
+
+                {error && <div className="error"><strong>Error:</strong> {error}</div>}
+
+                {downloadUrl && (
+                  <div className="download-section">
+                    <a className="download" href={downloadUrl}>⬇ Download {outputType.toUpperCase()} file</a>
+                  </div>
+                )}
+
+                {rawMarkdown && (
+                  <div className="preview-section">
+                    <div className="preview-header">
+                      <strong>Output Preview</strong>
+                      <span className="muted small">{rawMarkdown.length.toLocaleString()} chars</span>
+                    </div>
+                    <div className="preview rendered-preview" dangerouslySetInnerHTML={{ __html: renderMarkdown(rawMarkdown) }} />
+                  </div>
+                )}
+              </section>
+
+              {/* ── Run history sidebar ──────────────────────────────── */}
+              {(mode === 'agent' || mode === 'chat' || mode === 'studio') && (
+                <aside className="card sidecard">
+                  <div className="sidebar-header">
+                    <h2>Run History</h2>
+                    {runs.length > 0 && <span className="run-count">{runs.length}</span>}
+                  </div>
+                  {runs.length === 0 && <p className="muted">No agent runs yet.</p>}
+                  {runs.map(run => (
+                    <div key={run.run_id} className="run">
+                      <div className="run-top">
+                        <strong>{run.agent_name || run.agent_id}</strong>
+                        <span className="run-type">{run.output_type}</span>
+                      </div>
+                      <span className="run-model">{run.model}</span>
+                      {run.rag_sources?.length > 0 && <span className="muted small">📚 {run.rag_sources.length} RAG source(s)</span>}
+                      <small>{new Date(run.timestamp).toLocaleString()}</small>
+                      {run.download_file && (
+                        <a href={`${API}/download/${run.download_file}`} className="run-download">⬇ Download</a>
+                      )}
+                    </div>
+                  ))}
+                </aside>
               )}
             </div>
           )}
 
-          {/* ── Run button (agent + studio) ────────────────────────────── */}
-          {(mode === 'agent' || mode === 'studio') && (
-            <button className="primary" onClick={generate} disabled={loading}>
-              {loading ? <><span className="spinner white" /> Running…</> : mode === 'agent' ? '⚡ Run Agent' : '🛠 Generate'}
-            </button>
-          )}
-
-          {error && <div className="error"><strong>Error:</strong> {error}</div>}
-
-          {downloadUrl && (
-            <div className="download-section">
-              <a className="download" href={downloadUrl}>⬇ Download {outputType.toUpperCase()} file</a>
-            </div>
-          )}
-
-          {rawMarkdown && (
-            <div className="preview-section">
-              <div className="preview-header">
-                <strong>Output Preview</strong>
-                <span className="muted small">{rawMarkdown.length.toLocaleString()} chars</span>
-              </div>
-              <div className="preview rendered-preview" dangerouslySetInnerHTML={{ __html: renderMarkdown(rawMarkdown) }} />
-            </div>
-          )}
-        </section>
-
-        {/* ── Run history sidebar (agent / chat / studio tabs only) ─── */}
-        {mode !== 'knowledge' && mode !== 'connectors' && <aside className="card sidecard">
-          <div className="sidebar-header">
-            <h2>Run History</h2>
-            {runs.length > 0 && <span className="run-count">{runs.length}</span>}
-          </div>
-          {runs.length === 0 && <p className="muted">No agent runs yet.</p>}
-          {runs.map(run => (
-            <div key={run.run_id} className="run">
-              <div className="run-top">
-                <strong>{run.agent_name || run.agent_id}</strong>
-                <span className="run-type">{run.output_type}</span>
-              </div>
-              <span className="run-model">{run.model}</span>
-              {run.rag_sources?.length > 0 && <span className="muted small">📚 {run.rag_sources.length} RAG source(s)</span>}
-              <small>{new Date(run.timestamp).toLocaleString()}</small>
-              {run.download_file && (
-                <a href={`${API}/download/${run.download_file}`} className="run-download">⬇ Download</a>
-              )}
-            </div>
-          ))}
-        </aside>}
-      </div>
-    </main>
+        </div>{/* /panel content */}
+      </div>{/* /main */}
+    </div>
   );
 }
