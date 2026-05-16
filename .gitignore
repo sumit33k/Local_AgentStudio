@@ -20,3 +20,14 @@ node_modules/
 # OS
 .DS_Store
 Thumbs.db
+
+# Audit logs (may contain sensitive info, keep local)
+deepseek-skill-studio/backend/audit/audit.log.jsonl
+
+# Local runtime env overrides
+local-runtime/.env
+local-runtime/.env.local
+
+# OpenClaw vendor state (managed by submodule, not checked in)
+vendor/openclaw/.env
+vendor/openclaw/.openclaw/

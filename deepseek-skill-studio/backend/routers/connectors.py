@@ -1,7 +1,7 @@
 """Settings + GitHub connector endpoints."""
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -26,8 +26,26 @@ DEFAULTS: Dict[str, Any] = {
     "rag_top_k": 5,
     "rag_chunk_size": 1000,
     "rag_chunk_overlap": 200,
+    # ── OpenClaw defaults ──────────────────────────────────────────────────
+    # Stored as a nested dict so openclaw settings are namespaced and don't
+    # collide with top-level LLM / RAG / GitHub keys.
+    "openclaw": {
+        "enabled": True,
+        "vendor_path": "../../vendor/openclaw",
+        "gateway_url": "http://127.0.0.1:18789",
+        "gateway_port": 18789,
+        "auto_start": False,
+        "managed_runtime": True,
+        "import_workspace_skills": True,
+        "expose_sessions": True,
+        "expose_tools": True,
+        "sandbox_mode": "balanced",
+        "log_level": "info",
+    },
 }
 
+# No openclaw settings are sensitive by default.
+# If a gateway bearer token is added in future, add "openclaw.gateway_token" here.
 _SENSITIVE = {"claude_api_key", "openai_api_key", "github_token"}
 
 
@@ -63,20 +81,22 @@ def get_settings():
 
 
 class SettingsUpdate(BaseModel):
-    llm_provider: str = None
-    ollama_base_url: str = None
-    ollama_model: str = None
-    ollama_embedding_model: str = None
-    claude_api_key: str = None
-    claude_model: str = None
-    openai_api_key: str = None
-    openai_model: str = None
-    openai_base_url: str = None
-    github_token: str = None
-    rag_enabled: bool = None
-    rag_top_k: int = None
-    rag_chunk_size: int = None
-    rag_chunk_overlap: int = None
+    llm_provider: Optional[str] = None
+    ollama_base_url: Optional[str] = None
+    ollama_model: Optional[str] = None
+    ollama_embedding_model: Optional[str] = None
+    claude_api_key: Optional[str] = None
+    claude_model: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    openai_model: Optional[str] = None
+    openai_base_url: Optional[str] = None
+    github_token: Optional[str] = None
+    rag_enabled: Optional[bool] = None
+    rag_top_k: Optional[int] = None
+    rag_chunk_size: Optional[int] = None
+    rag_chunk_overlap: Optional[int] = None
+    # Nested dict for all openclaw settings; merged with existing openclaw block on save.
+    openclaw: Optional[Dict[str, Any]] = None
 
 
 @router.put("/settings")
@@ -87,7 +107,13 @@ def update_settings(body: SettingsUpdate):
         # Don't overwrite sensitive keys with the masked placeholder
         if key in _SENSITIVE and val == "***":
             continue
-        current[key] = val
+        # Deep-merge nested dicts (e.g. the openclaw block) rather than replacing
+        # them outright, so callers can update individual openclaw keys without
+        # having to re-send the entire nested object.
+        if isinstance(val, dict) and isinstance(current.get(key), dict):
+            current[key] = {**current[key], **val}
+        else:
+            current[key] = val
     save_settings(current)
     return mask_settings(current)
 

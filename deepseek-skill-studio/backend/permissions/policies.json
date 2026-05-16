@@ -1,0 +1,20 @@
+{
+  "read_files": "allow_once",
+  "write_files": "deny",
+  "execute_shell": "deny",
+  "network": "allow_session",
+  "browser": "deny",
+  "github": "allow_session",
+  "mcp_tools": "allow_once",
+  "secrets": "deny",
+  "memory": "allow_session",
+  "rag": "always_allow",
+  "package_install": "deny",
+  "generate_files": "always_allow",
+  "system_access": "deny",
+  "openclaw_runtime": "allow_once",
+  "openclaw_gateway": "allow_session",
+  "openclaw_sessions": "allow_session",
+  "openclaw_channels": "deny",
+  "openclaw_tools": "allow_session"
+}

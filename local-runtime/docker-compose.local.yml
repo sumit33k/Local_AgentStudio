@@ -1,0 +1,116 @@
+version: "3.9"
+
+# Local AgentStudio Pro — Docker Compose (local development)
+#
+# All ports are bound to 127.0.0.1 only.
+# No service is reachable from the network without explicit port forwarding.
+#
+# Usage:
+#   docker compose -f docker-compose.local.yml up --build
+#   docker compose -f docker-compose.local.yml down
+
+networks:
+  agentstudio_internal:
+    driver: bridge
+    internal: false   # allows outbound internet (Ollama, Claude API, OpenAI API)
+
+services:
+
+  # ── FastAPI backend ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ../deepseek-skill-studio/backend
+      dockerfile: Dockerfile
+    container_name: agentstudio_backend
+    restart: unless-stopped
+    networks:
+      - agentstudio_internal
+    ports:
+      # Bind to loopback only — not 0.0.0.0
+      - "127.0.0.1:8000:8000"
+    environment:
+      - CORS_ALLOW_ALL=${CORS_ALLOW_ALL:-true}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-deepseek-r1:8b}
+      - OUTPUT_TTL_DAYS=${OUTPUT_TTL_DAYS:-7}
+      - OPENCLAW_GATEWAY_PORT=${OPENCLAW_GATEWAY_PORT:-18789}
+      - OPENCLAW_GATEWAY_URL=http://openclaw:18789
+    volumes:
+      # Persistent data directories — survive container restarts
+      - ../deepseek-skill-studio/backend/data:/app/data
+      - ../deepseek-skill-studio/backend/agents:/app/agents
+      - ../deepseek-skill-studio/backend/skills:/app/skills
+      - ../deepseek-skill-studio/backend/output:/app/output
+      - ../deepseek-skill-studio/backend/agent_runs:/app/agent_runs
+      - ../deepseek-skill-studio/backend/conversations:/app/conversations
+      - ../deepseek-skill-studio/backend/permissions:/app/permissions
+      - ../deepseek-skill-studio/backend/audit:/app/audit
+      # settings.json is NOT mounted — configure via environment variables
+    depends_on:
+      - openclaw
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Next.js frontend ───────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ../deepseek-skill-studio/frontend
+      dockerfile: Dockerfile
+    container_name: agentstudio_frontend
+    restart: unless-stopped
+    networks:
+      - agentstudio_internal
+    ports:
+      # Bind to loopback only
+      - "127.0.0.1:3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://127.0.0.1:8000}
+      - HOST=0.0.0.0   # Next.js must bind inside the container on 0.0.0.0
+                        # but is only reachable via 127.0.0.1 on the host
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── OpenClaw gateway ───────────────────────────────────────────────────────
+  openclaw:
+    image: node:20-slim
+    container_name: agentstudio_openclaw
+    restart: unless-stopped
+    working_dir: /app
+    networks:
+      - agentstudio_internal
+    ports:
+      # Bind to loopback only
+      - "127.0.0.1:18789:18789"
+    environment:
+      - OPENCLAW_PORT=${OPENCLAW_GATEWAY_PORT:-18789}
+      - OPENCLAW_STATE_DIR=/app/.openclaw
+    volumes:
+      # Mount the vendored OpenClaw submodule (read-only)
+      - ../vendor/openclaw:/app:ro
+      # Writable state directory for OpenClaw sessions and logs
+      - openclaw_state:/app/.openclaw
+    command: >
+      node /app/openclaw.mjs gateway
+      --host 0.0.0.0
+      --port 18789
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:18789/status', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  openclaw_state:
+    driver: local
