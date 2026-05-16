@@ -32,7 +32,7 @@ cd ..
 echo "Starting frontend..."
 cd frontend
 npm install
-npm run dev &
+npm run dev -- -p 3005
 FRONTEND_PID=$!
 cd ..
 

@@ -63,5 +63,19 @@
       "docx",
       "markdown"
     ]
+  },
+  "local_ai_agent": {
+    "name": "Local AI Agent",
+    "description": "An AI agent designed to run a local host application and execute a test case using a provided Markdown (md) file.",
+    "default_skill": "codebase_analyzer",
+    "default_output": "md",
+    "system_addendum": "Ensure the md file is accessible in the system's working directory. Use markdown for any output related to the test case execution.",
+    "allowed_tools": [
+      "files",
+      "github",
+      "markdown"
+    ],
+    "created_by_prompt": "create agent to run local host aplication and crun test case using demo md file \r\n",
+    "created_at": "2026-05-16T15:34:10.407285Z"
   }
 }
